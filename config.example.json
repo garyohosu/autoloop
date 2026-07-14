@@ -1,0 +1,23 @@
+{
+  "agent": {
+    "name": "codex",
+    "command": ["codex", "exec", "--sandbox", "workspace-write"],
+    "prompt_delivery": "argument",
+    "timeout_seconds": 1800
+  },
+  "design_files": [
+    "SPEC.md",
+    "USECASE.md",
+    "SEQUENCE.md",
+    "CLASS.md",
+    "UI.md",
+    "TESTCASE.md",
+    "QandA.md"
+  ],
+  "verification_commands": [["py", "-m", "pytest", "-q"]],
+  "max_cycles": 10,
+  "stop_on_agent_failure": true,
+  "stop_on_test_failure": false,
+  "commit_enabled": false,
+  "push_enabled": false
+}
