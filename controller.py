@@ -7,8 +7,10 @@ repository. It never commits or pushes changes.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -92,6 +94,8 @@ class Config:
     stop_on_test_failure: bool = False
     commit_enabled: bool = False
     push_enabled: bool = False
+    allow_dirty_worktree: bool = False
+    allowed_dirty_paths: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path, root: Path | None = None) -> "Config":
@@ -141,6 +145,12 @@ class Config:
                 f"{sorted(VALID_PROMPT_DELIVERIES)}: {prompt_delivery!r}"
             )
 
+        allowed_raw = raw.get("allowed_dirty_paths", [])
+        if not isinstance(allowed_raw, list) or any(
+            not isinstance(item, str) for item in allowed_raw
+        ):
+            raise ControllerError("allowed_dirty_paths must be a list of strings")
+
         return cls(
             detected,
             automation,
@@ -155,6 +165,8 @@ class Config:
             bool(raw.get("stop_on_test_failure", False)),
             bool(raw.get("commit_enabled", False)),
             bool(raw.get("push_enabled", False)),
+            bool(raw.get("allow_dirty_worktree", False)),
+            [relative(item) for item in allowed_raw],
         )
 
 
@@ -181,9 +193,14 @@ class Lock:
             self.held = False
 
 
-def changed_files(root: Path) -> list[str]:
+def _clean_status_path(value: str) -> str:
+    return value.strip().strip('"').replace("\\", "/")
+
+
+def status_entries(root: Path, exclude: str | None = None) -> list[dict[str, str | None]]:
+    """Parse `git status --porcelain -uall`, optionally excluding one directory."""
     result = subprocess.run(
-        ["git", "status", "--short"],
+        ["git", "status", "--porcelain", "-uall"],
         cwd=root,
         text=True,
         capture_output=True,
@@ -191,14 +208,82 @@ def changed_files(root: Path) -> list[str]:
     )
     if result.returncode:
         raise ControllerError(result.stderr.strip() or "git status failed")
-    files: list[str] = []
+    prefix = f"{exclude}/" if exclude else None
+    entries: list[dict[str, str | None]] = []
     for line in result.stdout.splitlines():
-        if len(line) >= 4:
-            value = line[3:].strip()
-            if " -> " in value:
-                value = value.split(" -> ")[-1]
-            files.append(value.replace("\\", "/"))
-    return sorted(set(files))
+        if len(line) < 4:
+            continue
+        status, value = line[:2], line[3:]
+        orig = None
+        if " -> " in value:
+            orig, value = value.split(" -> ", 1)
+        path = _clean_status_path(value)
+        if prefix and (path == exclude or path.startswith(prefix)):
+            continue
+        entries.append(
+            {
+                "status": status,
+                "path": path,
+                "orig_path": _clean_status_path(orig) if orig else None,
+            }
+        )
+    return entries
+
+
+def changed_files(root: Path, exclude: str | None = None) -> list[str]:
+    return sorted({entry["path"] for entry in status_entries(root, exclude)})
+
+
+def file_record(root: Path, path: str, status: str | None, orig_path: str | None) -> dict[str, Any]:
+    """Capture the observable state of one path for dirty-file protection."""
+    target = root / path
+    kind, size, digest = "missing", None, None
+    if target.is_symlink():
+        kind = "symlink"
+    elif target.is_dir():
+        kind = "dir"
+    elif target.is_file():
+        data = target.read_bytes()
+        kind, size, digest = "file", len(data), hashlib.sha256(data).hexdigest()
+    return {
+        "status": status,
+        "kind": kind,
+        "exists": kind != "missing",
+        "size": size,
+        "sha256": digest,
+        "orig_path": orig_path,
+    }
+
+
+def snapshot(root: Path, paths: list[str], exclude: str | None = None) -> dict[str, dict[str, Any]]:
+    by_path = {entry["path"]: entry for entry in status_entries(root, exclude)}
+    records: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        entry = by_path.get(path)
+        records[path] = file_record(
+            root,
+            path,
+            entry["status"] if entry else None,
+            entry["orig_path"] if entry else None,
+        )
+    return records
+
+
+CYCLE_LOG_NAME = re.compile(r"cycle-(\d+)")
+CYCLE_RECEIPT_NAME = re.compile(r"cycle-(\d+)\.json")
+
+
+def next_cycle_number(runtime: Path) -> int:
+    """Continue numbering after the highest valid cycle in logs and receipts."""
+    highest = 0
+    for folder, pattern in (("logs", CYCLE_LOG_NAME), ("receipts", CYCLE_RECEIPT_NAME)):
+        base = runtime / folder
+        if base.is_dir():
+            for entry in base.iterdir():
+                match = pattern.fullmatch(entry.name)
+                if match:
+                    highest = max(highest, int(match.group(1)))
+    return highest + 1
 
 
 def run_process(
@@ -263,11 +348,21 @@ class Controller:
     def receipt_path(self, cycle: int) -> Path:
         return self.runtime / "receipts" / f"cycle-{cycle:03d}.json"
 
-    def cycle(self, number: int, previous: dict[str, Any] | None) -> dict[str, Any]:
-        started = timestamp()
+    def cycle(
+        self,
+        number: int,
+        previous: dict[str, Any] | None,
+        protected: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
         run_dir = self.runtime / "logs" / f"cycle-{number:03d}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        before = changed_files(self.config.root)
+        receipt_file = self.receipt_path(number)
+        if run_dir.exists() or receipt_file.exists():
+            raise ControllerError(
+                f"cycle artifacts already exist, refusing to overwrite: cycle-{number:03d}"
+            )
+        started = timestamp()
+        run_dir.mkdir(parents=True)
+        before = changed_files(self.config.root, self.config.automation_dir)
         prompt = build_prompt(self.config, previous)
 
         if self.config.prompt_delivery == "stdin":
@@ -301,7 +396,13 @@ class Controller:
                     {"command": command, "exit_code": code, "error": test_error}
                 )
 
-        after = changed_files(self.config.root)
+        after = changed_files(self.config.root, self.config.automation_dir)
+        current = snapshot(self.config.root, sorted(protected), self.config.automation_dir)
+        violations = []
+        for path, record in protected.items():
+            fields = [key for key in record if current[path].get(key) != record.get(key)]
+            if fields:
+                violations.append({"path": path, "changes": fields})
         no_change = before == after
         test_failed = any(item["exit_code"] != 0 for item in tests)
         human = "HUMAN_CONFIRMATION" in stdout or "人間の判断" in stdout
@@ -309,6 +410,8 @@ class Controller:
 
         if error:
             decision = error
+        elif violations:
+            decision = "protected_dirty_changed"
         elif exit_code != 0 and self.config.stop_on_agent_failure:
             decision = "agent_failed"
         elif test_failed and self.config.stop_on_test_failure:
@@ -337,19 +440,51 @@ class Controller:
             "before_changed_files": before,
             "tests": tests,
             "agent_error": error,
+            "preexisting_dirty_files": sorted(protected),
+            "agent_changed_files": [path for path in after if path not in protected],
+            "protected_dirty_violations": violations,
         }
-        path = self.receipt_path(number)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
+        receipt_file.parent.mkdir(parents=True, exist_ok=True)
+        receipt_file.write_text(
+            json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         return receipt
+
+    def dirty_gate(self) -> tuple[list[str], list[str]]:
+        """Return dirty paths and the subset not covered by allowed_dirty_paths."""
+        dirty = changed_files(self.config.root, self.config.automation_dir)
+        allowed = self.config.allowed_dirty_paths
+        disallowed = [
+            path
+            for path in dirty
+            if not any(path == item or path.startswith(f"{item}/") for item in allowed)
+        ]
+        return dirty, disallowed
 
     def run(self, once: bool = False) -> list[dict[str, Any]]:
         self.lock.acquire()
         receipts: list[dict[str, Any]] = []
         try:
-            for cycle in range(1, 2 if once else self.config.max_cycles + 1):
+            dirty, disallowed = self.dirty_gate()
+            if dirty and (not self.config.allow_dirty_worktree or disallowed):
+                blocked = dirty if not self.config.allow_dirty_worktree else disallowed
+                print(
+                    f"ERROR: dirty worktree, agent not started: {', '.join(blocked)}",
+                    file=sys.stderr,
+                )
+                return [
+                    {
+                        "decision": "dirty_worktree",
+                        "dirty_paths": dirty,
+                        "disallowed_paths": disallowed,
+                        "finished_at": timestamp(),
+                    }
+                ]
+            protected = snapshot(self.config.root, dirty, self.config.automation_dir)
+            start = next_cycle_number(self.runtime)
+            for offset in range(1 if once else self.config.max_cycles):
                 previous = receipts[-1] if receipts else None
-                receipt = self.cycle(cycle, previous)
+                receipt = self.cycle(start + offset, previous, protected)
                 receipts.append(receipt)
                 if receipt["decision"] != "continue":
                     break
@@ -358,6 +493,20 @@ class Controller:
             return receipts + [{"decision": "interrupted", "finished_at": timestamp()}]
         finally:
             self.lock.release()
+
+
+SUCCESS_DECISIONS = frozenset({"completed", "continue", "no_change"})
+HUMAN_CONFIRMATION_EXIT_CODE = 2
+
+
+def exit_code_for(receipts: list[dict[str, Any]]) -> int:
+    """Map the final decision to the controller process exit code."""
+    decision = receipts[-1].get("decision") if receipts else None
+    if decision in SUCCESS_DECISIONS:
+        return 0
+    if decision == "human_confirmation":
+        return HUMAN_CONFIRMATION_EXIT_CODE
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -383,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
         config = Config.load(config_path, root)
         result = Controller(config).run(args.once)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
+        return exit_code_for(result)
     except ControllerError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

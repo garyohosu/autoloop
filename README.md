@@ -165,8 +165,42 @@ The generated prompt instructs the agent to make technical and reversible decisi
 - Verification commands are fixed argv lists from the target configuration.
 - Logs and receipts remain in the target project.
 - Start with `--once` before using continuous mode.
+- Uncommitted changes are never stashed, reset, or deleted by AutoLoop.
 
 The configured agent can still modify files within its own permission boundary. Review the agent command and sandbox settings before using AutoLoop on important repositories.
+
+### Dirty worktree protection
+
+A dirty worktree is rejected by default. If the target repository contains any tracked or untracked changes (outside `.runtime/`), AutoLoop stops with decision `dirty_worktree` before starting the agent and reports the detected paths on stderr and in the result JSON. Do not work around this by stashing, resetting, or committing existing changes — run the first cycle in a clean dedicated test repository or a fresh `git worktree` instead. This also applies to AI CLI agents operating AutoLoop: never continue unconditionally on a dirty worktree.
+
+`allow_dirty_worktree` is an explicit setting for advanced use:
+
+```json
+{
+  "allow_dirty_worktree": false,
+  "allowed_dirty_paths": []
+}
+```
+
+Even with `"allow_dirty_worktree": true`, only paths listed in `allowed_dirty_paths` may be dirty. Entries must be relative paths inside the target Git root; absolute paths, `..`, and UNC paths are rejected. Any dirty path not covered by the list still stops the run.
+
+Pre-existing dirty files are protected by hashing. Before the agent runs, AutoLoop records each allowed dirty file (git status, file type, existence, size, SHA-256, stage state, rename information). After the agent and verification finish, the state is captured again; if any protected file was modified, deleted, renamed, staged, or unstaged, AutoLoop stops with decision `protected_dirty_changed`. Receipts record `preexisting_dirty_files`, `agent_changed_files`, and `protected_dirty_violations` separately, so agent-created changes are distinguished from the user's pre-existing changes.
+
+### Cycle numbering
+
+Cycle numbers continue from the existing runtime history: the next cycle is one greater than the highest valid `cycle-NNN` found under `.runtime/logs/` and `.runtime/receipts/` (invalid names such as `cycle-test` or `backup-cycle-001.json` are ignored). Existing logs and receipts are never overwritten; if a cycle directory or receipt already exists at the chosen number, AutoLoop stops safely with an error.
+
+### Exit codes
+
+The controller process exit code reflects the final decision:
+
+| Final decision | Process exit code |
+|---|---|
+| `completed`, `continue`, `no_change` | 0 |
+| `human_confirmation` | 2 |
+| `dirty_worktree`, `protected_dirty_changed`, `agent_failed`, `test_failed`, `agent_not_found`, `timeout`, other errors | 1 |
+
+`human_confirmation` uses a dedicated exit code (2) so callers can distinguish "needs a human decision" from real failures.
 
 ## Tests
 

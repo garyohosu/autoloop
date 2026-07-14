@@ -19,5 +19,7 @@
   "stop_on_agent_failure": true,
   "stop_on_test_failure": false,
   "commit_enabled": false,
-  "push_enabled": false
+  "push_enabled": false,
+  "allow_dirty_worktree": false,
+  "allowed_dirty_paths": []
 }
