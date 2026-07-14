@@ -524,6 +524,29 @@ class ExitCodeTests(BaseControllerTest):
         )
         self.assertEqual(code, 1)
 
+    def test_installer_antigravity_command_syntax(self):
+        install_path = Path(__file__).parent / "install.ps1"
+        self.assertTrue(install_path.exists())
+        content = install_path.read_text(encoding="utf-8")
+
+        # Verify antigravity block exists and has correct order of args
+        self.assertIn('"antigravity"', content)
+        self.assertIn('"agy.exe"', content)
+
+        # Ensure --prompt is at the very end of the antigravity array
+        idx_agy = content.find('"agy.exe"')
+        idx_skip = content.find('"--dangerously-skip-permissions"', idx_agy)
+        idx_prompt = content.find('"--prompt"', idx_agy)
+
+        self.assertNotEqual(idx_agy, -1)
+        self.assertNotEqual(idx_skip, -1)
+        self.assertNotEqual(idx_prompt, -1)
+        self.assertTrue(idx_skip < idx_prompt, "(--dangerously-skip-permissions) must appear before (--prompt)")
+
+        # Verify codex and claude blocks are intact
+        self.assertIn('"codex"', content)
+        self.assertIn('"claude"', content)
+
 
 if __name__ == "__main__":
     unittest.main()

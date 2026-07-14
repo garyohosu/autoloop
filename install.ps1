@@ -92,8 +92,9 @@ function Resolve-CodexCommand {
 switch ($SelectedAgent) {
     "antigravity" {
         $AgentCommand = @(
-            "agy.exe", "--prompt", "--dangerously-skip-permissions",
-            "--mode", "accept-edits", "--print-timeout", "30m"
+            "agy.exe", "--dangerously-skip-permissions",
+            "--mode", "accept-edits", "--print-timeout", "30m",
+            "--prompt"
         )
     }
     "codex" {
