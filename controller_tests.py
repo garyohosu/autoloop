@@ -209,6 +209,24 @@ class ControllerTests(BaseControllerTest):
             "human_confirmation",
         )
 
+    def test_negated_human_confirmation_does_not_stop(self):
+        root = self.repo()
+        command = self.agent(
+            "import sys; from pathlib import Path; Path('src/out.py').write_text('ok'); "
+            "sys.stdout.buffer.write('- HUMAN_CONFIRMATION: 不要\\n'.encode('utf-8'))"
+        )
+        receipt = Controller(self.config(root, command)).run(once=True)[0]
+        self.assertEqual(receipt["decision"], "continue")
+
+    def test_negated_english_human_confirmation_does_not_stop(self):
+        root = self.repo()
+        command = self.agent(
+            "from pathlib import Path; Path('src/out.py').write_text('ok'); "
+            "print('HUMAN_CONFIRMATION: not needed')"
+        )
+        receipt = Controller(self.config(root, command)).run(once=True)[0]
+        self.assertEqual(receipt["decision"], "continue")
+
     def test_lock_blocks_second_controller(self):
         root = self.repo()
         config = self.config(root)

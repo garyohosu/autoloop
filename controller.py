@@ -317,6 +317,33 @@ def run_process(
         return None, "", str(exc), "agent_error"
 
 
+HUMAN_CONFIRMATION_NEGATIONS = (
+    "不要",
+    "なし",
+    "不必要",
+    "該当なし",
+    "not needed",
+    "not required",
+    "none",
+)
+
+
+def requests_human_confirmation(stdout: str) -> bool:
+    """True when the agent asks to stop for a human decision.
+
+    Agents sometimes mention the marker while explicitly negating it
+    (e.g. "HUMAN_CONFIRMATION: 不要"); such lines must not stop the loop.
+    """
+    for line in stdout.splitlines():
+        if "HUMAN_CONFIRMATION" not in line and "人間の判断" not in line:
+            continue
+        lowered = line.lower()
+        if any(negation in lowered for negation in HUMAN_CONFIRMATION_NEGATIONS):
+            continue
+        return True
+    return False
+
+
 def build_prompt(config: Config, previous: dict[str, Any] | None) -> str:
     files = "\n".join(
         f"- {name}" for name in config.design_files if (config.root / name).is_file()
@@ -405,7 +432,7 @@ class Controller:
                 violations.append({"path": path, "changes": fields})
         no_change = before == after
         test_failed = any(item["exit_code"] != 0 for item in tests)
-        human = "HUMAN_CONFIRMATION" in stdout or "人間の判断" in stdout
+        human = requests_human_confirmation(stdout)
         complete = "PROJECT_COMPLETE" in stdout or "プロジェクト全体が完了" in stdout
 
         if error:

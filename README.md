@@ -2,6 +2,129 @@
 
 AutoLoop is a lightweight Python controller that repeatedly runs an AI coding agent against a target Git repository until the project is complete or human input is genuinely required.
 
+## Instructions for AI coding agents
+
+You are reading this README because the user wants to install or run AutoLoop in their target Git repository.
+
+Follow these rules strictly:
+
+- **No manual user actions**: Install and run AutoLoop automatically. Do not ask the user to copy files or edit JSON files unless the automatic setup completely fails.
+- **Do not modify the AutoLoop controller**: Do not change the design or logic of `controller.py` or `controller_tests.py` during installation.
+- **Run exactly one cycle**: By default, run only one cycle (`-Once`) to verify safety and configuration. Do not run in continuous mode unless the user explicitly requested it.
+- **No auto-commit/push**: Do not commit or push any changes inside the target project unless the user explicitly requested it.
+- **Do not touch uncommitted changes**: Do not delete, stash, or reset any existing uncommitted changes in the target project.
+- **Never proceed unconditionally on a dirty worktree**: AutoLoop refuses to start the agent when the target repository has tracked or untracked changes (decision `dirty_worktree`, exit code 1). Do not work around this by stashing, resetting, or committing the user's changes. Run the first cycle in a clean dedicated test repository or a fresh `git worktree` instead, or ask the user before setting `allow_dirty_worktree`.
+
+## Quick Start for AI CLI
+
+To install and run AutoLoop in the current target Git repository, execute the following steps.
+
+### Step 1: Verify the target repository
+
+```powershell
+git rev-parse --show-toplevel
+git status --short
+```
+
+If the current directory is not a Git repository, stop and report the error. If there are uncommitted changes, report them to the user, but **do not** stash, delete, or reset them — AutoLoop will refuse to run on a dirty worktree by default, so use a clean dedicated test repository or a fresh `git worktree` for the first cycle instead of forcing execution.
+
+### Step 2: Locate the AutoLoop repository
+
+Search for the AutoLoop home directory (where `controller.py` and `install.ps1` reside) in the following order:
+
+1. Environment variable `$env:AUTOLOOP_HOME`
+2. `autoloop_home` in the target's `.autoloop/local.json` (if present)
+3. Parent directory sibling (`../autoloop`)
+4. Windows default path (`C:\PROJECT\autoloop`)
+
+If it is not found in any of these places, clone it to a path outside the target repository:
+
+```powershell
+git clone https://github.com/garyohosu/autoloop.git C:\PROJECT\autoloop
+```
+
+If it already exists, do not clone it again. If you need to update it, verify it is clean and run `git pull --ff-only`.
+
+### Step 3: Run the installer
+
+Run the installer from the target repository root:
+
+```powershell
+& C:\PROJECT\autoloop\install.ps1 -Agent auto
+```
+
+`-Agent auto` detects an available agent CLI automatically. You may also specify one explicitly: `-Agent antigravity`, `-Agent codex`, or `-Agent claude`. On Windows, `-Agent codex` resolves the npm shim to a directly executable `node.exe` + `codex.js` command, because the controller starts agents with `shell=False`.
+
+### Step 4: Verify the installation output
+
+```powershell
+Test-Path .\.autoloop\config.json
+Test-Path .\.autoloop\local.json
+Test-Path .\.autoloop\run-autoloop.ps1
+```
+
+If any of these are missing, abort and report the error. Adjust `verification_commands` in `.autoloop/config.json` if the target project uses a different test command than the generated default.
+
+### Step 5: Run one cycle
+
+```powershell
+.\.autoloop\run-autoloop.ps1 -Once
+```
+
+Unless the user explicitly requests continuous execution, do not run without `-Once`.
+
+### Step 6: Verify and report the results
+
+```powershell
+git status --short
+Get-ChildItem .runtime -Recurse -ErrorAction SilentlyContinue
+```
+
+Review the newest receipt under `.runtime/receipts/` (cycle numbers continue from existing history) and report:
+
+- Selected agent and the generated agent command
+- Configuration file used
+- Controller process exit code (0 = success, 2 = needs human confirmation, 1 = failure)
+- Verification test results
+- Changed files (`agent_changed_files` vs `preexisting_dirty_files`)
+- Stop reason (`decision`)
+- Whether it is safe to proceed to continuous mode
+
+## Quick Start for humans
+
+If you want your AI agent (Antigravity, Claude Code, Codex CLI, ...) to install and run AutoLoop, copy and paste the following prompt.
+
+### Recommended prompt (Japanese)
+
+```text
+以下のREADMEを読んで、現在のGitリポジトリにAutoLoopを導入してください。
+
+https://github.com/garyohosu/autoloop/blob/main/README.md
+
+設定ファイルの生成、利用可能なAgentの選択、必要な事前確認を自動で行い、
+最初は1サイクルだけ実行してください。
+
+未コミットの変更を削除、stash、resetしないでください。
+commitとpushも行わないでください。
+最後に実行結果と停止理由を報告してください。
+```
+
+### Recommended prompt (English)
+
+```text
+Read the following README and install AutoLoop into the current Git repository:
+
+https://github.com/garyohosu/autoloop/blob/main/README.md
+
+Automatically detect the available coding-agent CLI, create the required
+configuration files, perform the required safety checks, and run exactly one
+AutoLoop cycle.
+
+Do not delete, stash, or reset existing uncommitted changes.
+Do not commit or push.
+Report the execution result and stop reason when finished.
+```
+
 ## What problem it solves
 
 AI coding tools can write code, but a human still has to repeat the work around each coding session:
@@ -52,6 +175,26 @@ The target project keeps its own specifications, test commands, agent configurat
 AutoLoop has no third-party Python dependencies.
 
 ## Target project setup
+
+### Automatic setup (recommended)
+
+Run the installer from the target repository root:
+
+```powershell
+Set-Location C:\PROJECT\target-project
+& C:\PROJECT\autoloop\install.ps1 -Agent auto
+```
+
+The installer:
+
+- verifies the target Git repository (and warns on a dirty worktree without touching it)
+- detects an available agent CLI (`agy` → `codex` → `claude`) when `-Agent auto` is used
+- generates `.autoloop/local.json` pointing at the AutoLoop home
+- generates `.autoloop/config.json` for the selected agent (on Windows, `codex` is resolved to a `node.exe` + `codex.js` command that works with `shell=False`)
+- copies `examples/run-autoloop.ps1` to `.autoloop/run-autoloop.ps1`
+- appends `.autoloop/local.json` and `.runtime/` to the target `.gitignore` without duplicating existing rules
+
+### Manual setup (alternative)
 
 Create an `.autoloop` directory in the target repository:
 
@@ -215,11 +358,15 @@ The tests use temporary Git repositories and fake agents, so they do not require
 
 This is an early Phase 1 implementation. It currently has:
 
+- README-driven setup executable by AI CLI agents
+- an installer (`install.ps1`) with agent auto-detection and config generation
 - configurable agent commands
 - argument or stdin prompt delivery
 - one-cycle and multi-cycle execution
 - fixed verification commands
 - target-side logs, receipts, and locking
+- dirty-worktree rejection and pre-existing dirty-file protection
+- cycle numbering that continues from existing runtime history
 
 It does not currently provide:
 
