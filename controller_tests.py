@@ -381,6 +381,16 @@ class DirtyWorktreeTests(BaseControllerTest):
         self.assertEqual(result[0]["decision"], "dirty_worktree")
         self.assertIn("NEW.md", result[0]["dirty_paths"])
 
+    def test_untracked_autoloop_dir_does_not_block(self):
+        root = self.repo()
+        autoloop_dir = root / ".autoloop"
+        autoloop_dir.mkdir()
+        (autoloop_dir / "config.json").write_text("{}", encoding="utf-8")
+        (autoloop_dir / "local.json").write_text("{}", encoding="utf-8")
+        receipt = Controller(self.config(root)).run(once=True)[0]
+        self.assertEqual(receipt["decision"], "continue")
+        self.assertEqual(receipt["preexisting_dirty_files"], [])
+
     def test_dirty_stop_leaves_existing_files_unchanged(self):
         root = self.repo()
         (root / "SPEC.md").write_text("modified", encoding="utf-8")

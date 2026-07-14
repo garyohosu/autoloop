@@ -30,6 +30,7 @@ DEFAULT_DESIGN_FILES = [
 ]
 DEFAULT_AGENT_COMMAND = ["codex", "exec", "--sandbox", "workspace-write"]
 VALID_PROMPT_DELIVERIES = frozenset({"argument", "stdin"})
+AUTOLOOP_CONFIG_DIR = ".autoloop"
 
 
 def timestamp() -> str:
@@ -197,8 +198,10 @@ def _clean_status_path(value: str) -> str:
     return value.strip().strip('"').replace("\\", "/")
 
 
-def status_entries(root: Path, exclude: str | None = None) -> list[dict[str, str | None]]:
-    """Parse `git status --porcelain -uall`, optionally excluding one directory."""
+def status_entries(
+    root: Path, exclude: str | tuple[str, ...] | None = None
+) -> list[dict[str, str | None]]:
+    """Parse `git status --porcelain -uall`, optionally excluding directories."""
     result = subprocess.run(
         ["git", "status", "--porcelain", "-uall"],
         cwd=root,
@@ -208,7 +211,8 @@ def status_entries(root: Path, exclude: str | None = None) -> list[dict[str, str
     )
     if result.returncode:
         raise ControllerError(result.stderr.strip() or "git status failed")
-    prefix = f"{exclude}/" if exclude else None
+    excludes = (exclude,) if isinstance(exclude, str) else tuple(exclude or ())
+    prefixes = tuple(f"{item}/" for item in excludes)
     entries: list[dict[str, str | None]] = []
     for line in result.stdout.splitlines():
         if len(line) < 4:
@@ -218,7 +222,7 @@ def status_entries(root: Path, exclude: str | None = None) -> list[dict[str, str
         if " -> " in value:
             orig, value = value.split(" -> ", 1)
         path = _clean_status_path(value)
-        if prefix and (path == exclude or path.startswith(prefix)):
+        if excludes and (path in excludes or path.startswith(prefixes)):
             continue
         entries.append(
             {
@@ -230,7 +234,7 @@ def status_entries(root: Path, exclude: str | None = None) -> list[dict[str, str
     return entries
 
 
-def changed_files(root: Path, exclude: str | None = None) -> list[str]:
+def changed_files(root: Path, exclude: str | tuple[str, ...] | None = None) -> list[str]:
     return sorted({entry["path"] for entry in status_entries(root, exclude)})
 
 
@@ -255,7 +259,9 @@ def file_record(root: Path, path: str, status: str | None, orig_path: str | None
     }
 
 
-def snapshot(root: Path, paths: list[str], exclude: str | None = None) -> dict[str, dict[str, Any]]:
+def snapshot(
+    root: Path, paths: list[str], exclude: str | tuple[str, ...] | None = None
+) -> dict[str, dict[str, Any]]:
     by_path = {entry["path"]: entry for entry in status_entries(root, exclude)}
     records: dict[str, dict[str, Any]] = {}
     for path in paths:
@@ -371,6 +377,8 @@ class Controller:
         self.config = config
         self.runtime = config.root / config.automation_dir
         self.lock = Lock(self.runtime / "autoloop.lock")
+        # AutoLoop's own directories are not part of the user's work.
+        self.excludes = (config.automation_dir, AUTOLOOP_CONFIG_DIR)
 
     def receipt_path(self, cycle: int) -> Path:
         return self.runtime / "receipts" / f"cycle-{cycle:03d}.json"
@@ -389,7 +397,7 @@ class Controller:
             )
         started = timestamp()
         run_dir.mkdir(parents=True)
-        before = changed_files(self.config.root, self.config.automation_dir)
+        before = changed_files(self.config.root, self.excludes)
         prompt = build_prompt(self.config, previous)
 
         if self.config.prompt_delivery == "stdin":
@@ -423,8 +431,8 @@ class Controller:
                     {"command": command, "exit_code": code, "error": test_error}
                 )
 
-        after = changed_files(self.config.root, self.config.automation_dir)
-        current = snapshot(self.config.root, sorted(protected), self.config.automation_dir)
+        after = changed_files(self.config.root, self.excludes)
+        current = snapshot(self.config.root, sorted(protected), self.excludes)
         violations = []
         for path, record in protected.items():
             fields = [key for key in record if current[path].get(key) != record.get(key)]
@@ -479,7 +487,7 @@ class Controller:
 
     def dirty_gate(self) -> tuple[list[str], list[str]]:
         """Return dirty paths and the subset not covered by allowed_dirty_paths."""
-        dirty = changed_files(self.config.root, self.config.automation_dir)
+        dirty = changed_files(self.config.root, self.excludes)
         allowed = self.config.allowed_dirty_paths
         disallowed = [
             path
@@ -507,7 +515,7 @@ class Controller:
                         "finished_at": timestamp(),
                     }
                 ]
-            protected = snapshot(self.config.root, dirty, self.config.automation_dir)
+            protected = snapshot(self.config.root, dirty, self.excludes)
             start = next_cycle_number(self.runtime)
             for offset in range(1 if once else self.config.max_cycles):
                 previous = receipts[-1] if receipts else None

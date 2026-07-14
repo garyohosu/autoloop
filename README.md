@@ -314,7 +314,7 @@ The configured agent can still modify files within its own permission boundary. 
 
 ### Dirty worktree protection
 
-A dirty worktree is rejected by default. If the target repository contains any tracked or untracked changes (outside `.runtime/`), AutoLoop stops with decision `dirty_worktree` before starting the agent and reports the detected paths on stderr and in the result JSON. Do not work around this by stashing, resetting, or committing existing changes — run the first cycle in a clean dedicated test repository or a fresh `git worktree` instead. This also applies to AI CLI agents operating AutoLoop: never continue unconditionally on a dirty worktree.
+A dirty worktree is rejected by default. If the target repository contains any tracked or untracked changes (outside AutoLoop's own `.runtime/` and `.autoloop/` directories), AutoLoop stops with decision `dirty_worktree` before starting the agent and reports the detected paths on stderr and in the result JSON. Freshly installed `.autoloop/` files therefore do not block the first cycle. Do not work around this by stashing, resetting, or committing existing changes — run the first cycle in a clean dedicated test repository or a fresh `git worktree` instead. This also applies to AI CLI agents operating AutoLoop: never continue unconditionally on a dirty worktree.
 
 `allow_dirty_worktree` is an explicit setting for advanced use:
 
