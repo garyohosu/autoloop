@@ -21,3 +21,24 @@
 - OracleCouncil本体ではなく`git worktree`でのクリーン実地試験(未コミット21件があるため)
 - human_confirmation終了コード2を利用した呼び出し側(oracle-council等)のハンドリング
 - タイムアウト時の子プロセス完全クリーンアップ(既知の制限)
+
+## 2026-07-14 18:15 Dreamingタイム
+
+### 今回やったこと
+- README自律導入機能を公開版へ復元: `install.ps1`(Agent自動検出、WindowsのCodexはnode.exe+codex.jsへ解決)、README冒頭のAI CLI向け指示・Quick Start・最短プロンプト
+- HUMAN_CONFIRMATION誤検知修正(「不要」等の否定行を除外)と、`.autoloop/`をdirty判定から除外する修正(インストール直後の`-Once`が動くように)
+- テスト48件全成功。専用テストリポジトリで install→dirty拒否→クリーン実行(exit 0)を実地確認
+- `1ecc81f feat: restore README-driven AutoLoop setup` をorigin/mainへpush
+
+### 気づいたこと
+- インストール直後は`.autoloop/`が未追跡になり旧仕様ではdirty拒否される、という導線の欠陥をREADME理解テストの設計中に発見できた
+- サンドボックス内の非対話エージェントはGitHub取得・keyring認証・ネストCLI起動ができず、URLだけ渡す無人E2Eは環境依存で完走しない
+- `codex exec`はstdinがパイプのまま開いていると起動待ちでハングする(`$null |`で回避)
+
+### 改善点
+- README理解テストは対話型AI CLI(Web取得可能)で行うのが現実的
+- installerの生成する`verification_commands`既定は対象プロジェクトに合わせて調整が必要
+
+### 次に試すとよさそうなこと
+- 対話型AI CLIに最短プロンプトだけを渡す実地E2E(人間の画面で確認)
+- installerにmacOS/Linux向けシェル版を用意するか検討
