@@ -1,5 +1,7 @@
 param(
-    [switch]$Once
+    [switch]$Once,
+    [switch]$LockStatus,
+    [switch]$UnlockStale
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +28,20 @@ if (-not $autoLoopHome) {
 
 if (-not (Test-Path $controller)) {
     throw "AutoLoop controller was not found: $controller"
+}
+
+if ($LockStatus -and $UnlockStale) {
+    throw "-LockStatus and -UnlockStale cannot be combined."
+}
+
+if ($LockStatus) {
+    & py $controller --project $projectRoot --config $projectConfigPath --lock-status
+    exit $LASTEXITCODE
+}
+
+if ($UnlockStale) {
+    & py $controller --project $projectRoot --config $projectConfigPath --unlock-stale
+    exit $LASTEXITCODE
 }
 
 $arguments = @(

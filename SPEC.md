@@ -866,6 +866,8 @@ lockには次を記録する。
 
 PIDが存在しない古いlockは、ログを残したうえでstale lockとして解除できる。
 
+> **実装状況の注記（2026-07-16）**: 本節（`<AUTOMATION_ROOT>\runner.lock`、task_id込みのスキーマ）とは別に、`controller.py`へ実際に実装・出荷された `RepositoryLock`（`.autoloop/run.lock`、対象リポジトリ側に保存、schema_version/repository/pid/started_at/hostname/controller_instance_id/mode等）がある。foreign_host・invalid・unknown分類やprocess開始時刻によるPID再利用対策は本節にない追加の安全策であり、本節の完全な実装ではない。実際の挙動は`README.md`「Exclusive repository lock」節、設計判断は`QandA.md` Q-08を参照。
+
 ---
 
 ## 21. ログと秘密情報

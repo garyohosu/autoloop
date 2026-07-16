@@ -4,6 +4,7 @@
 実装言語: Python 3.11 以上(Controller)。SPEC §4 の構成要素をそのままクラスへ対応させる。
 
 > **実装状況の注記（2026-07-16）**: 本書が定義する `InstructionFrontMatter` / `TaskStatus`（8値: draft/ready/running/completed/approval_required/blocked/failed/release_ready）を伴う Planner・session resume・Agent fallback・Controller自身によるcommit/push は未実装のままである。現在実装済みの `controller.py` には、本書とは別の、より小さい独立機能として single-task gate （`allow_task_chaining: false`、front matter は `task_id`/`status` の2項目のみ、`status` は pending/in_progress/completed/blocked/failed の5値）がある。本書の `TaskStatus` 8値とは別物であり、本書の一部実装ではない。実際の挙動は `README.md`「Single-task gate」節、設計判断は `QandA.md` Q-07 を参照。
+同様に、本書 §20 相当の `runner.lock`（task_id込みの二重起動防止設計）とは別に、`controller.py` には `RepositoryLock`（`.autoloop/run.lock`、foreign_host/invalid/unknown分類とWindowsでのプロセス開始時刻によるPID再利用対策あり）が実装・出荷済みである。本書の一部実装ではない。実際の挙動は `README.md`「Exclusive repository lock」節、設計判断は `QandA.md` Q-08 を参照。
 
 ---
 

@@ -11,8 +11,10 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,7 +110,7 @@ class Config:
     @classmethod
     def load(cls, path: Path, root: Path | None = None) -> "Config":
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ControllerError(f"config load failed: {exc}") from exc
         if not isinstance(raw, dict):
@@ -180,27 +182,315 @@ class Config:
         )
 
 
-class Lock:
-    def __init__(self, path: Path) -> None:
-        self.path = path
+LOCK_SCHEMA_VERSION = 1
+_REQUIRED_LOCK_FIELDS = (
+    "schema_version", "repository", "pid", "started_at", "hostname",
+    "controller_instance_id", "mode",
+)
+
+
+def _normalize_repository_path(root: Path) -> str:
+    """Canonical identifier for a Git repository root.
+
+    Used as the lock's `repository` field so that the same repository
+    invoked via a relative path, a trailing separator, a different drive
+    letter case, or a resolvable symlink still maps to one shared lock.
+    """
+    resolved = root.resolve()
+    text = str(resolved)
+    if os.name == "nt":
+        text = text.rstrip("\\/")
+        if len(text) >= 2 and text[1] == ":":
+            text = text[0].upper() + text[1:]
+    else:
+        text = text.rstrip("/")
+    return text
+
+
+def _windows_process_start_time(pid: int) -> str | None:
+    """Return an opaque, comparable process-start token, or None if the pid
+    does not currently exist. Windows-only; uses ctypes (stdlib) against
+    kernel32, no third-party dependency.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        ok = kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        )
+        if not ok:
+            return ""
+        value = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        return str(value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_liveness(pid: int, expected_start: str | None) -> str:
+    """Classify a recorded pid as "alive", "dead", or "unknown".
+
+    A pid that exists but whose process-start token does not match the one
+    recorded in the lock is treated as "dead": the original process is gone
+    and the OS has reused the pid number for something else.
+    """
+    if os.name == "nt":
+        try:
+            current_start = _windows_process_start_time(pid)
+        except Exception:
+            return "unknown"
+        if current_start is None:
+            return "dead"
+        if expected_start and current_start and current_start != expected_start:
+            return "dead"
+        return "alive"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead"
+    except PermissionError:
+        return "alive"
+    except OSError:
+        return "unknown"
+    return "alive"
+
+
+@dataclass
+class LockRecord:
+    """The persisted contents of `.autoloop/run.lock`."""
+
+    schema_version: int
+    repository: str
+    pid: int
+    started_at: str
+    hostname: str
+    controller_instance_id: str
+    mode: str
+    parent_pid: int | None = None
+    process_started_at: str | None = None
+    controller_path: str | None = None
+    cycle: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "repository": self.repository,
+            "pid": self.pid,
+            "parent_pid": self.parent_pid,
+            "started_at": self.started_at,
+            "process_started_at": self.process_started_at,
+            "hostname": self.hostname,
+            "controller_instance_id": self.controller_instance_id,
+            "controller_path": self.controller_path,
+            "mode": self.mode,
+            "cycle": self.cycle,
+        }
+
+
+@dataclass
+class LockStatus:
+    """Read-only classification of the current lock file.
+
+    state is one of: "none", "active", "stale", "foreign_host", "invalid",
+    "unknown". `record` is populated whenever a lock file could be parsed,
+    even for "invalid" (e.g. a repository mismatch) where the record itself
+    parsed fine but failed a cross-check.
+    """
+
+    state: str
+    record: LockRecord | None = None
+    error: str | None = None
+
+
+class LockAcquisitionError(ControllerError):
+    """Raised by RepositoryLock.acquire() when the lock is not available."""
+
+    def __init__(self, status: LockStatus) -> None:
+        self.status = status
+        super().__init__(f"repository lock not acquired: {status.state}")
+
+
+class RepositoryLock:
+    """Exclusive, per-repository lock at `.autoloop/run.lock`.
+
+    Replaces the earlier `.runtime/autoloop.lock` Lock class, which recorded
+    only pid/started_at and never checked whether that pid was still alive:
+    a crashed run left a lock that blocked every future run until a human
+    deleted the file by hand, with no way to tell "still running" apart from
+    "crashed" from outside the process. This class adds pid-liveness (with
+    process-start-time comparison to guard against pid reuse), hostname
+    scoping, and an explicit stale/foreign_host/invalid/unknown
+    classification so a stuck lock can be diagnosed and safely cleared.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        mode: str = "chaining",
+        controller_path: str | None = None,
+    ) -> None:
+        self.root = root
+        self.path = root / AUTOLOOP_CONFIG_DIR / "run.lock"
+        self.repository = _normalize_repository_path(root)
+        self.mode = mode
+        self.controller_path = controller_path
+        self.instance_id = str(uuid.uuid4())
         self.held = False
+        self._last_started_at: str | None = None
+
+    def _new_record(self) -> LockRecord:
+        return LockRecord(
+            schema_version=LOCK_SCHEMA_VERSION,
+            repository=self.repository,
+            pid=os.getpid(),
+            parent_pid=os.getppid() if hasattr(os, "getppid") else None,
+            started_at=timestamp(),
+            process_started_at=(
+                _windows_process_start_time(os.getpid()) if os.name == "nt" else None
+            ),
+            hostname=socket.gethostname(),
+            controller_instance_id=self.instance_id,
+            controller_path=self.controller_path,
+            mode=self.mode,
+        )
+
+    def _parse(self) -> LockStatus:
+        if not self.path.is_file():
+            return LockStatus(state="none")
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return LockStatus(state="invalid", error="lock file is not valid JSON")
+        if not isinstance(raw, dict):
+            return LockStatus(state="invalid", error="lock file is not a JSON object")
+        if any(key not in raw for key in _REQUIRED_LOCK_FIELDS):
+            return LockStatus(state="invalid", error="lock file missing required fields")
+        try:
+            record = LockRecord(
+                schema_version=int(raw["schema_version"]),
+                repository=str(raw["repository"]),
+                pid=int(raw["pid"]),
+                started_at=str(raw["started_at"]),
+                hostname=str(raw["hostname"]),
+                controller_instance_id=str(raw["controller_instance_id"]),
+                mode=str(raw["mode"]),
+                parent_pid=raw.get("parent_pid"),
+                process_started_at=raw.get("process_started_at"),
+                controller_path=raw.get("controller_path"),
+                cycle=raw.get("cycle"),
+            )
+        except (TypeError, ValueError):
+            return LockStatus(state="invalid", error="lock file has a field of the wrong type")
+        if record.repository != self.repository:
+            return LockStatus(
+                state="invalid", record=record,
+                error="lock file repository does not match this repository",
+            )
+        return LockStatus(state="unresolved", record=record)
+
+    def status(self) -> LockStatus:
+        """Classify the current lock file without acquiring or modifying it."""
+        parsed = self._parse()
+        if parsed.state != "unresolved":
+            return parsed
+        record = parsed.record
+        if record.hostname.lower() != socket.gethostname().lower():
+            # Windows hostnames are case-insensitive (e.g. $env:COMPUTERNAME
+            # vs socket.gethostname() can differ only in case for the same
+            # machine); compare case-insensitively so that doesn't produce a
+            # false foreign_host. A genuinely different host cannot be
+            # pid-checked at all from here, so it is still treated the same
+            # as a live lock rather than guessing.
+            return LockStatus(state="foreign_host", record=record)
+        liveness = _pid_liveness(record.pid, record.process_started_at)
+        if liveness == "alive":
+            return LockStatus(state="active", record=record)
+        if liveness == "dead":
+            return LockStatus(state="stale", record=record)
+        return LockStatus(state="unknown", record=record)
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        record = self._new_record()
         try:
             with self.path.open("x", encoding="utf-8") as stream:
-                json.dump({"pid": os.getpid(), "started_at": timestamp()}, stream)
-            self.held = True
-        except FileExistsError as exc:
-            raise ControllerError("another AutoLoop is already running") from exc
+                json.dump(record.to_dict(), stream, ensure_ascii=False, indent=2)
+        except FileExistsError:
+            raise LockAcquisitionError(self.status()) from None
+        self.held = True
+        self._last_started_at = record.started_at
 
-    def release(self) -> None:
-        if self.held:
+    def release(self) -> tuple[bool, str | None]:
+        """Release the lock. Returns (succeeded, warning).
+
+        Only removes the file if it still records this instance's
+        controller_instance_id, so a lock some other process re-created
+        (e.g. after this one crashed and a human force-cleared it) is never
+        deleted out from under that other process.
+        """
+        if not self.held:
+            return True, None
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            self.held = False
+            return False, "lock release skipped: lock file unreadable or not valid JSON"
+        if not isinstance(raw, dict) or raw.get("controller_instance_id") != self.instance_id:
+            self.held = False
+            return False, "lock release skipped: lock file no longer owned by this instance"
+        try:
+            self.path.unlink()
+        except OSError as exc:
+            return False, f"lock release failed: {exc}"
+        self.held = False
+        return True, None
+
+    def unlock_stale(self) -> LockStatus:
+        """Delete the lock file only when status() says it is unambiguously
+        stale. Never deletes active/foreign_host/invalid/unknown/none.
+        """
+        current = self.status()
+        if current.state == "stale":
             try:
                 self.path.unlink()
-            except OSError as exc:
-                print(f"warning: lock release failed: {exc}", file=sys.stderr)
-            self.held = False
+            except FileNotFoundError:
+                pass
+        return current
+
+
+def safe_lock_status(status: LockStatus) -> dict[str, Any]:
+    """Allowlisted view of a LockStatus for CLI display and receipts.
+
+    Deliberately omits parent_pid, process_started_at, and controller_path:
+    section 11's -LockStatus contract lists only state/pid/started_at/
+    repository/hostname/mode, and none of command, username, or environment
+    are ever included.
+    """
+    result: dict[str, Any] = {"state": status.state}
+    if status.record is not None:
+        result.update(
+            pid=status.record.pid,
+            started_at=status.record.started_at,
+            repository=status.record.repository,
+            hostname=status.record.hostname,
+            mode=status.record.mode,
+        )
+    if status.error:
+        result["error"] = status.error
+    return result
 
 
 _TASK_FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
@@ -238,7 +528,7 @@ def read_task_state(root: Path, task_file: str) -> TaskGateState:
     if not path.is_file():
         return TaskGateState(valid=False, error="task_file not found")
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except OSError:
         return TaskGateState(valid=False, error="task_file could not be read")
     match = _TASK_FRONTMATTER_RE.match(text)
@@ -498,6 +788,28 @@ def _base_receipt(cycle: int, started: str, project_root: Path, agent_name: str)
         "task_status_before": None,
         "task_status_after": None,
         "task_gate_error": None,
+        "repository_lock_path": None,
+        "repository_lock_acquired": False,
+        "repository_lock_instance_id": None,
+        "repository_lock_status": None,
+        "repository_lock_owner_pid": None,
+        "repository_lock_started_at": None,
+        "repository_lock_release_succeeded": None,
+        "repository_lock_warning": None,
+    }
+
+
+def _lock_receipt_fields(lock: "RepositoryLock") -> dict[str, Any]:
+    """Lock fields for a receipt produced while `lock` is held by this
+    process. release_succeeded/release_warning are filled in later, once
+    the lock is actually released at the end of run()."""
+    return {
+        "repository_lock_path": str(lock.path),
+        "repository_lock_acquired": True,
+        "repository_lock_instance_id": lock.instance_id,
+        "repository_lock_status": "active",
+        "repository_lock_owner_pid": os.getpid(),
+        "repository_lock_started_at": lock._last_started_at,
     }
 
 
@@ -505,7 +817,10 @@ class Controller:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.runtime = config.root / config.automation_dir
-        self.lock = Lock(self.runtime / "autoloop.lock")
+        lock_mode = "chaining" if config.allow_task_chaining else "single-task"
+        self.lock = RepositoryLock(
+            config.root, mode=lock_mode, controller_path=str(Path(__file__).resolve())
+        )
         # AutoLoop's own directories are not part of the user's work.
         self.excludes = (config.automation_dir, AUTOLOOP_CONFIG_DIR)
 
@@ -538,6 +853,7 @@ class Controller:
                 # never started and verification never runs.
                 run_dir.mkdir(parents=True)
                 receipt = _base_receipt(number, started, self.config.root, self.config.agent_name)
+                receipt.update(_lock_receipt_fields(self.lock))
                 receipt.update(
                     finished_at=timestamp(),
                     changed_files=changed_files(self.config.root, self.excludes),
@@ -562,6 +878,7 @@ class Controller:
                 # to look for other work.
                 run_dir.mkdir(parents=True)
                 receipt = _base_receipt(number, started, self.config.root, self.config.agent_name)
+                receipt.update(_lock_receipt_fields(self.lock))
                 receipt.update(
                     finished_at=timestamp(),
                     changed_files=changed_files(self.config.root, self.excludes),
@@ -682,6 +999,7 @@ class Controller:
             decision = "continue"
 
         receipt = _base_receipt(number, started, self.config.root, self.config.agent_name)
+        receipt.update(_lock_receipt_fields(self.lock))
         receipt.update(
             finished_at=timestamp(),
             agent_exit_code=exit_code,
@@ -724,7 +1042,41 @@ class Controller:
         return dirty, disallowed
 
     def run(self, once: bool = False) -> list[dict[str, Any]]:
-        self.lock.acquire()
+        try:
+            self.lock.acquire()
+        except LockAcquisitionError as exc:
+            decision = {
+                "active": "repository_locked",
+                "foreign_host": "repository_locked",
+                "stale": "stale_lock",
+                "invalid": "invalid_lock_file",
+                "unknown": "repository_locked",
+            }.get(exc.status.state, "lock_acquisition_failed")
+            record = exc.status.record
+            print(
+                f"ERROR: repository lock not acquired ({exc.status.state}), agent not started",
+                file=sys.stderr,
+            )
+            return [
+                {
+                    "decision": decision,
+                    "finished_at": timestamp(),
+                    "repository_lock_path": str(self.lock.path),
+                    "repository_lock_acquired": False,
+                    "repository_lock_instance_id": None,
+                    "repository_lock_status": exc.status.state,
+                    "repository_lock_owner_pid": record.pid if record else None,
+                    "repository_lock_started_at": record.started_at if record else None,
+                    "repository_lock_release_succeeded": None,
+                    "repository_lock_warning": exc.status.error,
+                }
+            ]
+
+        print(
+            "AutoLoop acquired the repository lock. Do not edit this worktree from "
+            "another AI coding session or IDE until AutoLoop exits.",
+            file=sys.stderr,
+        )
         receipts: list[dict[str, Any]] = []
         try:
             dirty, disallowed = self.dirty_gate()
@@ -734,14 +1086,16 @@ class Controller:
                     f"ERROR: dirty worktree, agent not started: {', '.join(blocked)}",
                     file=sys.stderr,
                 )
-                return [
+                receipts.append(
                     {
                         "decision": "dirty_worktree",
                         "dirty_paths": dirty,
                         "disallowed_paths": disallowed,
                         "finished_at": timestamp(),
+                        **_lock_receipt_fields(self.lock),
                     }
-                ]
+                )
+                return receipts
             protected = snapshot(self.config.root, dirty, self.excludes)
             start = next_cycle_number(self.runtime)
             for offset in range(1 if once else self.config.max_cycles):
@@ -752,9 +1106,21 @@ class Controller:
                     break
             return receipts
         except KeyboardInterrupt:
-            return receipts + [{"decision": "interrupted", "finished_at": timestamp()}]
+            receipts.append(
+                {
+                    "decision": "interrupted",
+                    "finished_at": timestamp(),
+                    **_lock_receipt_fields(self.lock),
+                }
+            )
+            return receipts
         finally:
-            self.lock.release()
+            succeeded, warning = self.lock.release()
+            if warning:
+                print(f"warning: {warning}", file=sys.stderr)
+            for receipt in receipts:
+                receipt["repository_lock_release_succeeded"] = succeeded
+                receipt["repository_lock_warning"] = warning
 
 
 SUCCESS_DECISIONS = frozenset({"completed", "continue", "no_change", "no_pending_task"})
@@ -786,10 +1152,35 @@ def main(argv: list[str] | None = None) -> int:
         help="Config path. Relative paths are resolved from the target project.",
     )
     parser.add_argument("--once", action="store_true", help="Run exactly one cycle.")
+    parser.add_argument(
+        "--lock-status",
+        action="store_true",
+        help="Report the repository lock state and exit. Never acquires the "
+        "lock or starts the agent.",
+    )
+    parser.add_argument(
+        "--unlock-stale",
+        action="store_true",
+        help="Remove the repository lock file only if it is unambiguously "
+        "stale (owning process no longer running). Never touches an "
+        "active, foreign_host, invalid, or unknown lock. Never starts "
+        "the agent.",
+    )
     args = parser.parse_args(argv)
 
     try:
         root = resolve_project_root(args.project)
+
+        if args.lock_status:
+            status = RepositoryLock(root).status()
+            print(json.dumps(safe_lock_status(status), ensure_ascii=False, indent=2))
+            return 0
+
+        if args.unlock_stale:
+            status = RepositoryLock(root).unlock_stale()
+            print(json.dumps(safe_lock_status(status), ensure_ascii=False, indent=2))
+            return 0 if status.state in ("stale", "none") else 1
+
         config_path = resolve_config_path(args.config, root)
         config = Config.load(config_path, root)
         result = Controller(config).run(args.once)

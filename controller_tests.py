@@ -1,9 +1,12 @@
 import contextlib
 import io
 import json
+import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -11,7 +14,9 @@ from controller import (
     Config,
     Controller,
     ControllerError,
-    Lock,
+    LockAcquisitionError,
+    LockStatus,
+    RepositoryLock,
     VALID_PROMPT_DELIVERIES,
     build_prompt,
     exit_code_for,
@@ -21,6 +26,7 @@ from controller import (
     read_task_state,
     resolve_config_path,
     resolve_project_root,
+    safe_lock_status,
 )
 
 
@@ -238,11 +244,13 @@ class ControllerTests(BaseControllerTest):
     def test_lock_blocks_second_controller(self):
         root = self.repo()
         config = self.config(root)
-        lock = Lock(root / ".runtime" / "autoloop.lock")
+        lock = RepositoryLock(root)
         lock.acquire()
         try:
-            with self.assertRaises(ControllerError):
-                Controller(config).run(once=True)
+            receipts = Controller(config).run(once=True)
+            self.assertEqual(receipts[0]["decision"], "repository_locked")
+            self.assertEqual(exit_code_for(receipts), 1)
+            self.assertFalse(receipts[0]["repository_lock_acquired"])
         finally:
             lock.release()
 
@@ -675,6 +683,20 @@ class TaskGateTests(BaseControllerTest):
         self.assertEqual(state.task_id, "S-9")
         self.assertEqual(state.status, "pending")
 
+    def test_read_task_state_tolerates_utf8_bom(self):
+        # Found via manual PowerShell verification: Set-Content -Encoding
+        # utf8 (and several common Windows editors) write a UTF-8 BOM by
+        # default. A gate file saved that way must still parse.
+        root = self.repo()
+        gate = root / GATE_FILE
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        gate.write_bytes(bytes([0xEF, 0xBB, 0xBF]) + '---\ntask_id: S-9\nstatus: pending\n---\n\nbody\n'.encode('utf-8'))
+        state = read_task_state(root, GATE_FILE)
+        self.assertTrue(state.valid)
+        self.assertEqual(state.task_id, 'S-9')
+        self.assertEqual(state.status, 'pending')
+
+
     def test_read_task_state_parses_crlf_frontmatter(self):
         root = self.repo()
         self.write_raw_gate(
@@ -1010,6 +1032,552 @@ class TaskGateTests(BaseControllerTest):
         prompt = build_prompt(config, None, None)
         self.assertNotIn(GATE_FILE, prompt)
 
+
+
+class RepositoryLockTests(BaseControllerTest):
+    """RepositoryLock: an exclusive, per-repository lock at .autoloop/run.lock.
+
+    Replaces the old Lock class (.runtime/autoloop.lock, pid+started_at only,
+    no liveness check - see QandA.md for why). All liveness checks below use
+    either the real pid of a short-lived Fake subprocess (never a real AI
+    agent) or, for the one genuinely hard-to-trigger state (unknown), a
+    monkeypatched controller._pid_liveness for that single test only.
+    """
+
+    def spawn_and_wait(self) -> int:
+        # A trivial subprocess whose pid is guaranteed dead by the time this
+        # returns, for constructing "stale" lock scenarios deterministically.
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait(timeout=10)
+        return proc.pid
+
+    def write_lock_json(self, root: Path, data: dict) -> Path:
+        path = root / ".autoloop" / "run.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def valid_record(self, root: Path, **overrides) -> dict:
+        base = {
+            "schema_version": 1,
+            "repository": str(root.resolve()),
+            "pid": os.getpid(),
+            "parent_pid": None,
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "process_started_at": None,
+            "hostname": socket.gethostname(),
+            "controller_instance_id": "11111111-1111-1111-1111-111111111111",
+            "controller_path": None,
+            "mode": "single-task",
+            "cycle": None,
+        }
+        base.update(overrides)
+        return base
+
+    # -- Acquisition --------------------------------------------------------
+
+    def test_acquire_succeeds_when_no_lock_exists(self):
+        root = self.repo()
+        lock = RepositoryLock(root)
+        lock.acquire()
+        try:
+            self.assertTrue(lock.path.is_file())
+        finally:
+            lock.release()
+
+    def test_lock_file_has_required_schema_fields(self):
+        root = self.repo()
+        lock = RepositoryLock(root)
+        lock.acquire()
+        try:
+            data = json.loads(lock.path.read_text(encoding="utf-8"))
+            for field in (
+                "schema_version", "repository", "pid", "started_at",
+                "hostname", "controller_instance_id", "mode",
+            ):
+                self.assertIn(field, data)
+            self.assertEqual(data["schema_version"], 1)
+        finally:
+            lock.release()
+
+    def test_lock_repository_field_is_normalized_absolute_path(self):
+        root = self.repo()
+        lock = RepositoryLock(root)
+        lock.acquire()
+        try:
+            data = json.loads(lock.path.read_text(encoding="utf-8"))
+            self.assertEqual(Path(data["repository"]), root.resolve())
+            self.assertTrue(Path(data["repository"]).is_absolute())
+        finally:
+            lock.release()
+
+    def test_lock_instance_id_is_unique_per_instance(self):
+        root = self.repo()
+        a = RepositoryLock(root)
+        b = RepositoryLock(root)
+        self.assertNotEqual(a.instance_id, b.instance_id)
+
+    def test_concurrent_acquire_only_one_succeeds(self):
+        root = self.repo()
+        results: list[str] = []
+        lock_results_guard = threading.Lock()
+        start_barrier = threading.Barrier(2)
+
+        def attempt():
+            lock = RepositoryLock(root)
+            start_barrier.wait()
+            try:
+                lock.acquire()
+                outcome = "ok"
+            except LockAcquisitionError:
+                outcome = "rejected"
+            with lock_results_guard:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(sorted(results), ["ok", "rejected"])
+
+    # -- active: a second acquire is rejected, -UnlockStale leaves it alone -
+
+    def test_active_lock_rejects_second_acquire(self):
+        root = self.repo()
+        first = RepositoryLock(root)
+        first.acquire()
+        try:
+            second = RepositoryLock(root)
+            with self.assertRaises(LockAcquisitionError) as ctx:
+                second.acquire()
+            self.assertEqual(ctx.exception.status.state, "active")
+        finally:
+            first.release()
+
+    def test_unlock_stale_does_not_remove_active_lock(self):
+        root = self.repo()
+        lock = RepositoryLock(root)
+        lock.acquire()
+        try:
+            status = RepositoryLock(root).unlock_stale()
+            self.assertEqual(status.state, "active")
+            self.assertTrue(lock.path.is_file())
+        finally:
+            lock.release()
+
+    # -- stale: dead pid, detected and only explicitly removable ------------
+
+    def test_stale_lock_detected_after_process_exits(self):
+        root = self.repo()
+        dead_pid = self.spawn_and_wait()
+        self.write_lock_json(root, self.valid_record(root, pid=dead_pid))
+        status = RepositoryLock(root).status()
+        self.assertEqual(status.state, "stale")
+
+    def test_unlock_stale_removes_stale_lock(self):
+        root = self.repo()
+        dead_pid = self.spawn_and_wait()
+        lock_path = self.write_lock_json(root, self.valid_record(root, pid=dead_pid))
+        status = RepositoryLock(root).unlock_stale()
+        self.assertEqual(status.state, "stale")
+        self.assertFalse(lock_path.is_file())
+
+    def test_acquire_succeeds_after_stale_lock_is_cleared(self):
+        root = self.repo()
+        dead_pid = self.spawn_and_wait()
+        self.write_lock_json(root, self.valid_record(root, pid=dead_pid))
+        RepositoryLock(root).unlock_stale()
+        lock = RepositoryLock(root)
+        lock.acquire()  # must not raise
+        lock.release()
+
+    # -- invalid: malformed lock file, never auto-removed -------------------
+
+    def test_invalid_json_lock_not_auto_removed(self):
+        root = self.repo()
+        lock_path = root / ".autoloop" / "run.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("{not valid json", encoding="utf-8")
+        status = RepositoryLock(root).status()
+        self.assertEqual(status.state, "invalid")
+        RepositoryLock(root).unlock_stale()
+        self.assertTrue(lock_path.is_file(), "invalid lock must survive -UnlockStale")
+
+    def test_missing_required_field_is_invalid(self):
+        root = self.repo()
+        record = self.valid_record(root)
+        del record["hostname"]
+        self.write_lock_json(root, record)
+        status = RepositoryLock(root).status()
+        self.assertEqual(status.state, "invalid")
+
+    def test_repository_mismatch_is_invalid(self):
+        root = self.repo()
+        other = self.repo()
+        self.write_lock_json(root, self.valid_record(other))
+        status = RepositoryLock(root).status()
+        self.assertEqual(status.state, "invalid")
+
+    # -- foreign_host: different hostname, never auto-removed ---------------
+
+    def test_same_host_different_case_is_not_foreign_host(self):
+        # A real-world mismatch found during manual verification:
+        # $env:COMPUTERNAME on Windows can differ only in case from
+        # socket.gethostname() for the same machine (e.g. all-caps vs
+        # mixed-case). The comparison must be case-insensitive so this
+        # doesn't produce a false foreign_host.
+        root = self.repo()
+        self.write_lock_json(root, self.valid_record(root, hostname=socket.gethostname().upper()))
+        status = RepositoryLock(root).status()
+        self.assertNotEqual(status.state, "foreign_host")
+
+    def test_foreign_host_lock_not_auto_removed(self):
+        root = self.repo()
+        self.write_lock_json(root, self.valid_record(root, hostname="some-other-host"))
+        status = RepositoryLock(root).status()
+        self.assertEqual(status.state, "foreign_host")
+        RepositoryLock(root).unlock_stale()
+        self.assertTrue((root / ".autoloop" / "run.lock").is_file())
+
+    def test_foreign_host_lock_rejects_acquire(self):
+        root = self.repo()
+        self.write_lock_json(root, self.valid_record(root, hostname="some-other-host"))
+        with self.assertRaises(LockAcquisitionError) as ctx:
+            RepositoryLock(root).acquire()
+        self.assertEqual(ctx.exception.status.state, "foreign_host")
+
+    # -- unknown: liveness cannot be determined, treated as blocking --------
+
+    def test_unknown_liveness_treated_as_blocking(self):
+        import controller as controller_module
+
+        root = self.repo()
+        self.write_lock_json(root, self.valid_record(root, pid=os.getpid()))
+        original = controller_module._pid_liveness
+        controller_module._pid_liveness = lambda pid, expected: "unknown"
+        try:
+            status = RepositoryLock(root).status()
+            self.assertEqual(status.state, "unknown")
+            RepositoryLock(root).unlock_stale()
+            self.assertTrue((root / ".autoloop" / "run.lock").is_file())
+            with self.assertRaises(LockAcquisitionError):
+                RepositoryLock(root).acquire()
+        finally:
+            controller_module._pid_liveness = original
+
+    # -- pid reuse: alive pid, mismatched start time -> stale ---------------
+
+    def test_pid_reuse_with_mismatched_start_time_is_stale(self):
+        import controller as controller_module
+
+        root = self.repo()
+        self.write_lock_json(
+            root,
+            self.valid_record(root, pid=os.getpid(), process_started_at="definitely-not-a-real-token"),
+        )
+        original = controller_module._windows_process_start_time
+        controller_module._windows_process_start_time = lambda pid: "current-real-token"
+        try:
+            status = RepositoryLock(root).status()
+            self.assertIn(status.state, ("stale", "active"))
+            if os.name == "nt":
+                self.assertEqual(status.state, "stale")
+        finally:
+            controller_module._windows_process_start_time = original
+
+    # -- release: only by the owning instance --------------------------------
+
+    def test_release_does_not_remove_foreign_instance_lock(self):
+        root = self.repo()
+        lock = RepositoryLock(root)
+        lock.acquire()
+        # Simulate another process re-writing the lock with a different
+        # controller_instance_id (e.g. after this one crashed and a human
+        # cleared + a new run started) before this instance's release runs.
+        data = json.loads(lock.path.read_text(encoding="utf-8"))
+        data["controller_instance_id"] = "99999999-9999-9999-9999-999999999999"
+        lock.path.write_text(json.dumps(data), encoding="utf-8")
+        succeeded, warning = lock.release()
+        self.assertFalse(succeeded)
+        self.assertIsNotNone(warning)
+        self.assertTrue(lock.path.is_file(), "must not delete a lock it no longer owns")
+
+    def test_release_failure_produces_warning(self):
+        root = self.repo()
+        lock = RepositoryLock(root)
+        lock.acquire()
+        lock.path.write_text("{corrupted", encoding="utf-8")
+        succeeded, warning = lock.release()
+        self.assertFalse(succeeded)
+        self.assertIsNotNone(warning)
+
+    def test_release_is_a_no_op_when_never_acquired(self):
+        root = self.repo()
+        lock = RepositoryLock(root)
+        succeeded, warning = lock.release()
+        self.assertTrue(succeeded)
+        self.assertIsNone(warning)
+
+    # -- release happens on every Controller.run() outcome -------------------
+
+    def test_lock_released_after_normal_completion(self):
+        root = self.repo()
+        receipt = Controller(self.config(root)).run(once=True)[0]
+        self.assertTrue(receipt["repository_lock_release_succeeded"])
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    def test_lock_released_after_no_pending_task(self):
+        root = self.repo()
+        gate = root / "instructions" / "instructions.md"
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        gate.write_text("---\ntask_id: T-1\nstatus: completed\n---\n\nbody\n", encoding="utf-8")
+        subprocess.run(["git", "add", "instructions/instructions.md"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "gate"], cwd=root, check=True)
+        config = Config(
+            root, design_files=["SPEC.md"],
+            verification_commands=[[sys.executable, "-c", "pass"]],
+            agent_command=self.agent("pass"), allow_task_chaining=False,
+        )
+        receipt = Controller(config).run()[0]
+        self.assertEqual(receipt["decision"], "no_pending_task")
+        self.assertTrue(receipt["repository_lock_release_succeeded"])
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    def test_lock_released_after_task_gate_invalid(self):
+        root = self.repo()
+        config = Config(
+            root, design_files=["SPEC.md"],
+            verification_commands=[[sys.executable, "-c", "pass"]],
+            agent_command=self.agent("pass"), allow_task_chaining=False,
+        )
+        receipt = Controller(config).run()[0]
+        self.assertEqual(receipt["decision"], "task_gate_invalid")
+        self.assertTrue(receipt["repository_lock_release_succeeded"])
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    def test_lock_released_after_agent_failure(self):
+        root = self.repo()
+        receipt = Controller(
+            self.config(root, self.agent("raise SystemExit(7)"))
+        ).run(once=True)[0]
+        self.assertEqual(receipt["decision"], "agent_failed")
+        self.assertTrue(receipt["repository_lock_release_succeeded"])
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    def test_lock_released_after_verification_failure(self):
+        root = self.repo()
+        config = self.config(
+            root,
+            self.agent("from pathlib import Path; Path('src/out.py').write_text('ok')"),
+            verification_commands=[[sys.executable, "-c", "raise SystemExit(1)"]],
+            stop_on_test_failure=True,
+        )
+        receipt = Controller(config).run(once=True)[0]
+        self.assertEqual(receipt["decision"], "test_failed")
+        self.assertTrue(receipt["repository_lock_release_succeeded"])
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    def test_lock_released_after_dirty_worktree(self):
+        root = self.repo()
+        (root / "SPEC.md").write_text("modified", encoding="utf-8")
+        receipt = Controller(self.config(root)).run(once=True)[0]
+        self.assertEqual(receipt["decision"], "dirty_worktree")
+        self.assertTrue(receipt["repository_lock_release_succeeded"])
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    def test_lock_released_after_keyboard_interrupt(self):
+        root = self.repo()
+        config = self.config(root)
+        controller = Controller(config)
+        original_cycle = controller.cycle
+
+        def raising_cycle(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        controller.cycle = raising_cycle
+        receipts = controller.run(once=True)
+        self.assertEqual(receipts[-1]["decision"], "interrupted")
+        self.assertTrue(receipts[-1]["repository_lock_release_succeeded"])
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    def test_lock_not_created_on_configuration_error(self):
+        root = self.repo()
+        path = root / "config.json"
+        path.write_text(json.dumps({"task_file": "../escape.md"}), encoding="utf-8")
+        with self.assertRaises(ControllerError):
+            Config.load(path, root)
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    # -- lock acquisition failure: agent/verification/commit never happen ---
+
+    def test_lock_failure_does_not_invoke_agent(self):
+        root = self.repo()
+        marker = root / "agent_ran.txt"
+        agent = self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")
+        held = RepositoryLock(root)
+        held.acquire()
+        try:
+            receipts = Controller(self.config(root, agent)).run(once=True)
+            self.assertEqual(receipts[0]["decision"], "repository_locked")
+            self.assertFalse(marker.exists())
+        finally:
+            held.release()
+
+    def test_lock_failure_does_not_touch_task_file(self):
+        root = self.repo()
+        gate = root / "instructions" / "instructions.md"
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        gate.write_text("---\ntask_id: T-1\nstatus: pending\n---\n\nbody\n", encoding="utf-8")
+        subprocess.run(["git", "add", "instructions/instructions.md"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "gate"], cwd=root, check=True)
+        before = gate.read_text(encoding="utf-8")
+        config = Config(
+            root, design_files=["SPEC.md"],
+            verification_commands=[[sys.executable, "-c", "pass"]],
+            agent_command=self.agent("pass"), allow_task_chaining=False,
+        )
+        held = RepositoryLock(root)
+        held.acquire()
+        try:
+            receipts = Controller(config).run()
+            self.assertEqual(receipts[0]["decision"], "repository_locked")
+        finally:
+            held.release()
+        self.assertEqual(gate.read_text(encoding="utf-8"), before)
+
+    def test_lock_failure_leaves_worktree_unchanged(self):
+        # No commit logic exists in controller.py at all (commit_enabled is
+        # a config placeholder not yet wired to any git action), so "does
+        # not commit on lock failure" reduces to: the working tree is
+        # byte-for-byte unchanged after a rejected acquire.
+        root = self.repo()
+        before = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True
+        ).stdout
+        held = RepositoryLock(root)
+        held.acquire()
+        try:
+            Controller(self.config(root)).run(once=True)
+        finally:
+            held.release()
+        after = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True
+        ).stdout
+        self.assertEqual(before, after)
+
+    # -- no secrets in the lock file or the receipt --------------------------
+
+    def test_lock_file_contains_no_env_secrets(self):
+        root = self.repo()
+        os.environ["AUTOLOOP_TEST_SECRET_TOKEN"] = "sk-should-never-appear-anywhere"
+        try:
+            lock = RepositoryLock(root)
+            lock.acquire()
+            try:
+                content = lock.path.read_text(encoding="utf-8")
+                self.assertNotIn("sk-should-never-appear-anywhere", content)
+                self.assertNotIn("AUTOLOOP_TEST_SECRET_TOKEN", content)
+            finally:
+                lock.release()
+        finally:
+            del os.environ["AUTOLOOP_TEST_SECRET_TOKEN"]
+
+    def test_receipt_lock_fields_contain_no_secrets(self):
+        root = self.repo()
+        os.environ["AUTOLOOP_TEST_SECRET_TOKEN"] = "sk-should-never-appear-in-receipt"
+        try:
+            receipt = Controller(self.config(root)).run(once=True)[0]
+            self.assertNotIn(
+                "sk-should-never-appear-in-receipt", json.dumps(receipt, ensure_ascii=False)
+            )
+        finally:
+            del os.environ["AUTOLOOP_TEST_SECRET_TOKEN"]
+
+    def test_safe_lock_status_omits_command_and_username(self):
+        root = self.repo()
+        lock = RepositoryLock(root)
+        lock.acquire()
+        try:
+            status = RepositoryLock(root).status()
+            safe = safe_lock_status(status)
+            for forbidden in ("username", "command", "parent_pid", "process_started_at", "controller_path"):
+                self.assertNotIn(forbidden, safe)
+            for expected in ("state", "pid", "started_at", "repository", "hostname", "mode"):
+                self.assertIn(expected, safe)
+        finally:
+            lock.release()
+
+    # -- CLI: --lock-status / --unlock-stale never touch the agent ----------
+
+    def run_main_capture(self, args: list[str]) -> tuple[int, str]:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = main(args)
+        return code, buf.getvalue()
+
+    def test_lock_status_flag_does_not_acquire(self):
+        root = self.repo()
+        code, out = self.run_main_capture(["--project", str(root), "--lock-status"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["state"], "none")
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    def test_lock_status_flag_does_not_invoke_agent(self):
+        root = self.repo()
+        marker = root / "agent_ran.txt"
+        path = root / "config.json"
+        path.write_text(
+            json.dumps({"agent": {"command": self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")}}),
+            encoding="utf-8",
+        )
+        code, _ = self.run_main_capture(
+            ["--project", str(root), "--config", str(path), "--lock-status"]
+        )
+        self.assertEqual(code, 0)
+        self.assertFalse(marker.exists())
+
+    def test_unlock_stale_flag_does_not_invoke_agent(self):
+        root = self.repo()
+        marker = root / "agent_ran.txt"
+        path = root / "config.json"
+        path.write_text(
+            json.dumps({"agent": {"command": self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")}}),
+            encoding="utf-8",
+        )
+        dead_pid = self.spawn_and_wait()
+        self.write_lock_json(root, self.valid_record(root, pid=dead_pid))
+        code, out = self.run_main_capture(
+            ["--project", str(root), "--config", str(path), "--unlock-stale"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["state"], "stale")
+        self.assertFalse(marker.exists())
+        self.assertFalse((root / ".autoloop" / "run.lock").is_file())
+
+    def test_unlock_stale_active_lock_via_cli_returns_exit_1(self):
+        root = self.repo()
+        held = RepositoryLock(root)
+        held.acquire()
+        try:
+            code, out = self.run_main_capture(["--project", str(root), "--unlock-stale"])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["state"], "active")
+        finally:
+            held.release()
+
+    def test_powershell_wrapper_lockstatus_args_match_readme(self):
+        wrapper = Path(__file__).parent / "examples" / "run-autoloop.ps1"
+        content = wrapper.read_text(encoding="utf-8")
+        self.assertIn("[switch]$LockStatus", content)
+        self.assertIn("[switch]$UnlockStale", content)
+        self.assertIn("--lock-status", content)
+        self.assertIn("--unlock-stale", content)
+        readme = Path(__file__).parent / "README.md"
+        readme_text = readme.read_text(encoding="utf-8")
+        self.assertIn("-LockStatus", readme_text)
+        self.assertIn("-UnlockStale", readme_text)
 
 if __name__ == "__main__":
     unittest.main()

@@ -151,7 +151,7 @@ Copy-Item -Path $SourceWrapper -Destination (Join-Path $AutoloopDir "run-autoloo
 
 # --- Update the target repository's .gitignore (append only, no duplicates) ---
 $GitignorePath = Join-Path $ProjectRoot ".gitignore"
-$IgnoreRules = @(".autoloop/local.json", ".runtime/")
+$IgnoreRules = @(".autoloop/local.json", ".autoloop/run.lock", ".runtime/")
 $ExistingContent = ""
 if (Test-Path $GitignorePath) {
     $ExistingContent = Get-Content -Path $GitignorePath -Raw

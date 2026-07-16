@@ -279,6 +279,148 @@ The agent is selected entirely through `agent.command`:
 
 This allows the same controller to work with different coding agents when they provide a non-interactive CLI.
 
+## Exclusive repository lock
+
+AutoLoop takes an exclusive, per-repository lock before it does anything else — before reading the single-task gate file, before checking for a dirty worktree, before starting the agent. This closes a real gap: in one incident, a human's Claude Code session and an AutoLoop run edited the same target repository at the same time, and `controller.py`'s own content changed mid-test-run because of it. A lock cannot stop that entirely (see "What the lock does not do" below), but it does stop two AutoLoop runs from doing it to each other.
+
+The lock lives at `.autoloop/run.lock` in the **target** repository (not in the AutoLoop repository), keyed to the target's Git root, not to which `config.json` or which machine-local path was used to start it — two differently-spelled invocations of the same repository (a relative path, a trailing separator, a different drive-letter case, a resolvable symlink) share the same lock. `.autoloop/run.lock` is never committed (see "Target project setup" and the installer's generated `.gitignore` rules).
+
+### Lock file schema
+
+```json
+{
+  "schema_version": 1,
+  "repository": "C:\\PROJECT\\ExampleRepo",
+  "pid": 12345,
+  "parent_pid": 6789,
+  "started_at": "2026-07-16T09:00:00+09:00",
+  "process_started_at": "132803...",
+  "hostname": "HOST-NAME",
+  "controller_instance_id": "5b1e...-uuid",
+  "controller_path": "C:\\PROJECT\\autoloop\\controller.py",
+  "mode": "single-task",
+  "cycle": null
+}
+```
+
+Required fields: `schema_version`, `repository`, `pid`, `started_at`, `hostname`, `controller_instance_id`, `mode`. The lock never records API keys, tokens, credentials, environment variables, the agent prompt, or full stdout/stderr — and, deliberately, no `username` and no full launch `command`, since neither is needed to make a locking decision and both can be more sensitive or less portable than the fields above.
+
+### Acquisition is atomic
+
+The lock file is created with an exclusive, atomic open (`open(path, "x", ...)` in Python terms) — never "check if it exists, then write." When two processes race to acquire it, exactly one succeeds and the other is rejected; nothing about `config.json`, the single-task gate file, source code, the Git index, or a commit is touched before that succeeds.
+
+### Lock states
+
+| State | Meaning | `-UnlockStale` |
+|---|---|---|
+| `none` | No lock file | n/a |
+| `active` | Same hostname, pid is alive (and, on Windows, its start time matches — see below) | Never removed |
+| `stale` | Same hostname, pid is not alive (or a different process now holds that pid) | Removed |
+| `foreign_host` | `hostname` does not match this machine, so liveness cannot be checked from here | Never removed |
+| `invalid` | Not valid JSON, missing a required field, a field has the wrong type, or `repository` does not match this repository | Never removed |
+| `unknown` | Liveness could not be determined at all | Never removed |
+
+Acquiring while the lock is `active`, `foreign_host`, or `unknown` fails with decision `repository_locked` (exit 1). Acquiring while it is `invalid` fails with decision `invalid_lock_file` (exit 1). Acquiring while it is `stale` fails with decision `stale_lock` (exit 1) — a stale lock is never auto-removed by an acquire attempt; only an explicit `-UnlockStale` clears it (see below).
+
+**Why `stale` is never auto-cleared on acquire**: auto-clearing on every startup would defeat the purpose — a slow-starting concurrent run could still be mid-write when a second run decides the lock "looks stale" and clears it out from under it. Requiring a separate, explicit `-UnlockStale` step means a human (or an automation wrapper) makes that call deliberately, at a moment when they can also check "is this actually done, or just slow?"
+
+**Why pid liveness isn't the whole story (pid reuse)**: an OS can reuse a process id after the original process exits. On Windows, the lock also records `process_started_at` (an opaque, comparable process-creation token from `GetProcessTimes` via `ctypes` — no third-party dependency); if a process with the recorded pid exists but its start time doesn't match, that pid was reused by something else, and the lock is classified `stale`, not `active`. On non-Windows platforms this token isn't collected, and liveness falls back to whether the pid exists at all.
+
+**Why `foreign_host` is treated the same as `active`**: from this machine, there is no reliable way to check whether a pid on a *different* host is still alive. Guessing "probably safe to clear" would be exactly the wrong default for a networked/shared-drive setup; treating an unverifiable remote lock as blocking is the safe-by-default choice.
+
+### Checking and clearing the lock
+
+```powershell
+.\.autoloop\run-autoloop.ps1 -LockStatus
+.\.autoloop\run-autoloop.ps1 -UnlockStale
+```
+
+`-LockStatus` never acquires the lock, never starts the agent, and never modifies anything — it only reports `state` and, when a lock file is present, `pid`, `started_at`, `repository`, `hostname`, and `mode`. It exits 0 whenever the report itself succeeds, regardless of the state found.
+
+`-UnlockStale` removes the lock file only when `status()` says it is unambiguously `stale`; it never starts the agent and never touches `config.json`, the single-task gate file, or the Git index. It exits 0 when a stale lock was removed (or there was no lock to remove) and exits 1 when the lock exists but is not stale (`active`/`foreign_host`/`invalid`/`unknown` all refuse).
+
+Both map directly to the controller: `py controller.py --project <target> --lock-status` / `--unlock-stale`.
+
+### Recovering after a crash or forced shutdown
+
+An OS-level kill, a crashed process, or a power loss can leave `.autoloop/run.lock` behind with no chance to run the normal release path. That lock will read as `stale` once the recorded pid is confirmed gone (or reused). Recovery is:
+
+```powershell
+.\.autoloop\run-autoloop.ps1 -LockStatus     # confirm it really is stale
+.\.autoloop\run-autoloop.ps1 -UnlockStale    # remove it
+.\.autoloop\run-autoloop.ps1 -Once           # resume normally
+```
+
+### Release
+
+The lock is released in a `finally` block covering every stop condition — normal completion, `no_pending_task`, `task_gate_invalid`, `human_confirmation`, agent failure, verification failure, `dirty_worktree`, and `KeyboardInterrupt` all release it. Before deleting the file, release re-reads it and only removes it if `controller_instance_id` still matches this process's own instance — so a lock some other process re-created (for example, after a human ran `-UnlockStale` and a new run started) is never deleted out from under that other process. If release cannot proceed (the file is gone, unreadable, or owned by another instance), the run's original decision is kept, a warning is printed to stderr and recorded on the receipt, and the lock file itself is never forcibly overwritten.
+
+### Processing order
+
+```text
+1. Resolve the target Git root
+2. --lock-status / --unlock-stale (read-only; return here, lock never touched)
+3. Acquire the repository lock
+4. Load and validate config.json
+5. Check the single-task gate (if allow_task_chaining is false)
+6. Check for a dirty worktree
+7. Run the agent
+8. Run verification
+9. (commit, when/if implemented)
+10. Save the receipt
+11. Release the repository lock
+```
+
+If the lock cannot be acquired, none of steps 4 onward run for that attempt.
+
+### Receipt fields
+
+Every receipt — including the three lock-failure decisions, `dirty_worktree`, and every normal cycle receipt — carries the same eight lock fields, filled with `None`/`false` when they don't apply:
+
+```text
+repository_lock_path
+repository_lock_acquired
+repository_lock_instance_id
+repository_lock_status
+repository_lock_owner_pid
+repository_lock_started_at
+repository_lock_release_succeeded
+repository_lock_warning
+```
+
+None of these ever include the full lock file, environment variables, the agent's prompt, or full stdout/stderr.
+
+### New decisions and exit codes
+
+| Decision | Exit code | Meaning |
+|---|---|---|
+| `repository_locked` | 1 | Lock is `active`, `foreign_host`, or `unknown` |
+| `stale_lock` | 1 | Lock is `stale` (use `-UnlockStale`, then retry) |
+| `invalid_lock_file` | 1 | Lock file failed validation |
+| `lock_acquisition_failed` | 1 | Any other lock failure |
+
+Existing decisions and exit codes (§ "Exit codes" above) are unchanged.
+
+### What the lock does not do
+
+The lock stops two AutoLoop runs from racing on the same repository. It does **not**, and cannot, stop a human editing the same worktree in an IDE, or another AI coding session (Claude Code, Codex, a different Antigravity session, ...) editing it directly — none of those go through `controller.py` at all, so there is nothing for the lock to intercept. When AutoLoop acquires the lock, it prints once to stderr:
+
+```text
+AutoLoop acquired the repository lock. Do not edit this worktree from another AI coding session or IDE until AutoLoop exits.
+```
+
+Treat that as the operational rule: don't hand-edit or run a second AI session against the same worktree while AutoLoop holds the lock. A stronger technical guarantee — running AutoLoop against a dedicated Git worktree or branch instead of the human's own working tree — is a deliberately separate, not-yet-implemented piece of work (see "Current status").
+
+### Troubleshooting
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| `repository_locked`, exit 1, no agent output | Another AutoLoop run (or one that's still running) holds the lock | `-LockStatus` to see who; wait, or investigate that other run |
+| `stale_lock`, exit 1 | The lock's owning process is confirmed gone, but nothing has cleared it yet | `-UnlockStale`, then retry |
+| `invalid_lock_file`, exit 1 | `.autoloop/run.lock` is corrupted or was hand-edited | Inspect the file manually; it is never auto-repaired or auto-removed |
+| `-UnlockStale` exits 1 | The lock isn't stale (it's active/foreign_host/invalid/unknown) | Re-check with `-LockStatus`; don't force-remove an active lock |
+| Lock persists after a crash | Expected — the release path never ran | Confirm `stale` with `-LockStatus`, then `-UnlockStale` |
+
 ## Single-task gate (`allow_task_chaining`)
 
 By default AutoLoop lets the agent pick any small task it likes each cycle (`allow_task_chaining: true`, the default, and the only behaviour before this feature existed). This kept existing `config.json` files working unchanged.
@@ -443,9 +585,11 @@ This is an early Phase 1 implementation. It currently has:
 - dirty-worktree rejection and pre-existing dirty-file protection
 - cycle numbering that continues from existing runtime history
 - an opt-in single-task gate (`allow_task_chaining: false`) that restricts a run to one `task_id`
+- an exclusive, per-repository lock (`.autoloop/run.lock`) with stale/foreign-host/invalid detection, `-LockStatus`, and `-UnlockStale`
 
 It does not currently provide:
 
+- running AutoLoop in a dedicated worktree or branch instead of the caller's own working tree (the repository lock stops two AutoLoop runs from racing, but not a human or another AI session editing the same worktree directly)
 - automatic fallback between coding agents
 - automatic commit or push
 - a GUI

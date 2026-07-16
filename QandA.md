@@ -46,3 +46,17 @@
 - **`pending` と `in_progress` をどう扱うか**: 両方を「着手が承認された状態」として同一に扱う。サイクル開始時・Agent実行後の継続判定のどちらでも、`pending` と `in_progress` は同じ経路（Agent起動 / `continue`）に合流する。`in_progress` は `pending` の同義語として、Agentが「作業に着手したが未完了」であることをより具体的に示したいときに使う目的だけを持つ。既存の `completed`/`blocked`/`failed` はいずれも「今は着手できない・停止する」側に分類する。
 
 **変更ファイル**: `src/oracle_council/...` に相当する対象はなし（本リポジトリの対象は `controller.py`/`controller_tests.py`/`README.md`/`config.example.json`/`install.ps1`/本ファイルのみ）。排他ロック、Planner、tasks.yamlキュー、複数Agent、フェイルオーバー、worktree分離は本項の対象外で未着手のまま。
+
+## Q-08: 実装済み排他ロック（RepositoryLock）の設計判断（2026-07-16）
+
+本項はQ-07（single-task gate）と同様、SPEC.md §20記載の`runner.lock`設計（`<AUTOMATION_ROOT>`側、task_id込みスキーマ）とは別に、`controller.py`へ実際に実装・出荷された`RepositoryLock`についての記録である。
+
+- **なぜロックを対象リポジトリ側（`.autoloop/run.lock`）へ置くか**: ロックの目的は「同じ対象Gitリポジトリへの同時操作を防ぐ」ことであり、単位は対象リポジトリそのものである。AutoLoop本体（`C:\PROJECT\autoloop`）側や自動化用の別ディレクトリへ置くと、同じ対象リポジトリを異なる`config.json`・異なる起動元・異なるAutoLoopのコピーから操作した場合にロックが共有されず、排他制御そのものが機能しない。対象リポジトリのGitルートを正規化した絶対パスを`repository`フィールドの正本とすることで、相対パス・末尾区切り文字・Windowsの大文字小文字・シンボリックリンク経由などの別表記でも同じロックへ収束させている。
+- **なぜ既存`.runtime/autoloop.lock`（Lockクラス）を置き換えるか**: 旧実装はpidと起動時刻だけを記録し、生存確認を一切行わなかった。クラッシュ後に残ったロックファイルは、次回起動が永久に「another AutoLoop is already running」で失敗し続ける原因になり、人間が手動でファイルを削除する以外に復旧手段がなかった。`RepositoryLock`は生存確認・stale判定・明示解除コマンドを備え、この復旧不能な状態を解消する。旧ロックファイル（`.runtime/autoloop.lock`）が既存プロジェクトに残っていても自動削除・自動移行はしない。それは単なる旧runtimeディレクトリ内の残骸であり、新しい`RepositoryLock`は`.autoloop/run.lock`のみを見るため、共存していても機能上の問題は生じない。
+- **なぜstaleを自動削除しないか**: 起動のたびに自動的にstale判定・削除を行うと、同時に起動しようとした別プロセスがまだロックファイル書き込みの途中（あるいは起動直後でまだ生存確認に反映されていない）場合に、誤って有効なロックを削除してしまう競合状態を生みかねない。stale判定とその解除を`-UnlockStale`という別個の明示操作に分離することで、人間（または自動化ラッパー）が「本当に終わっているか、単に遅いだけか」を確認したうえで意図的に解除する運用を強制する。
+- **なぜPIDだけで判定しないか（PID再利用対策）**: OSはプロセス終了後に同じPID番号を別プロセスへ再利用することがある。PIDの存在有無だけで生存確認すると、元のAutoLoopプロセスがクラッシュした直後にOSが同じPIDを別の無関係なプロセスへ割り当てた場合、誤って「まだ生きている」と判定してしまう。Windowsでは`GetProcessTimes`（`ctypes`経由、追加ライブラリ不要）によるプロセス開始時刻を記録・比較し、PIDが存在してもその開始時刻がロック記録と一致しない場合は「別プロセスによるPID再利用＝実質的にstale」と分類する。
+- **なぜforeign_hostをactive相当として扱うか**: `hostname`が現在のマシンと異なるロックは、そもそもこのマシンからPIDの生存確認ができない（別マシンのプロセステーブルは参照不可能）。判定不能な状態を「たぶん大丈夫だろう」と楽観的に扱うと、共有ドライブやネットワーク越しの運用で複数マシンが同時に同じ対象リポジトリを操作してしまう危険がある。安全側に倒し、判定不能な remote lock は常にブロックする（`active`と同じ扱い、自動削除しない）。
+- **なぜ人間やIDEによる直接編集は防げないか**: このロックは`controller.py`が読み書きする`.autoloop/run.lock`というファイル上の合意であり、OS自体のファイル編集権限を制限するものではない。人間が別のエディタ・IDE・Claude Code等の別AIセッションで同じ作業ツリーを直接編集する行為は、そもそも`controller.py`を経由しないため、ロックの対象にならない。ロック取得時にstderrへ警告（"Do not edit this worktree from another AI coding session or IDE until AutoLoop exits."）を表示するのはこのための運用上の注意喚起であり、技術的な強制力はない。
+- **worktree分離との違い**: worktree分離（対象リポジトリの作業ツリーとは別の専用worktree/ブランチでAutoLoopを動かす）は、人間や別AIセッションが元の作業ツリーを触っても物理的に競合しなくなる、より強い技術的保証である。今回実装した排他ロックは「AutoLoop同士の二重起動防止」という狭い範囲の問題を解決するものであり、worktree分離が提供するであろう「人間の直接編集からの隔離」までは提供しない。worktree分離は本項の対象外で、次の推奨作業として別途実装する。
+
+**変更ファイル**: `controller.py`、`controller_tests.py`、`README.md`、`SPEC.md`、`USECASE.md`、`SEQUENCE.md`、`CLASS.md`、`TESTCASE.md`（実装状況注記のみ）、`install.ps1`、`examples/run-autoloop.ps1`、本ファイル。Planner、tasks.yamlキュー、複数Agent、フェイルオーバー、worktree分離、single-task gate仕様そのものの変更、OracleCouncilはいずれも対象外・未着手。
