@@ -4,6 +4,8 @@
 方針: 実 Agent(Codex / Claude)や実 GitHub は使わず、Fake / Unit / Contract テストで検証する(SPEC §3.1)。live 評価は対象外(§3.2)。
 テスト用リポジトリ: 一時ディレクトリに作る fixture リポジトリ + fixture remote(bare リポジトリ)を用いる。
 
+> **実装状況の注記（2026-07-16）**: 本書が定義する `InstructionFrontMatter` / `TaskStatus`（8値: draft/ready/running/completed/approval_required/blocked/failed/release_ready）を伴う Planner・session resume・Agent fallback・Controller自身によるcommit/push は未実装のままである。現在実装済みの `controller.py` には、本書とは別の、より小さい独立機能として single-task gate （`allow_task_chaining: false`、front matter は `task_id`/`status` の2項目のみ、`status` は pending/in_progress/completed/blocked/failed の5値）がある。本書の `TaskStatus` 8値とは別物であり、本書の一部実装ではない。実際の挙動は `README.md`「Single-task gate」節、設計判断は `QandA.md` Q-07 を参照。
+
 ---
 
 ## 1. ユニットテスト

@@ -21,5 +21,7 @@
   "commit_enabled": false,
   "push_enabled": false,
   "allow_dirty_worktree": false,
-  "allowed_dirty_paths": []
+  "allowed_dirty_paths": [],
+  "allow_task_chaining": true,
+  "task_file": "instructions/instructions.md"
 }

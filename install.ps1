@@ -136,6 +136,8 @@ $Config = [ordered]@{
     push_enabled = $false
     allow_dirty_worktree = $false
     allowed_dirty_paths = @()
+    allow_task_chaining = $true
+    task_file = "instructions/instructions.md"
 }
 $Config | ConvertTo-Json -Depth 6 |
     Set-Content -Path (Join-Path $AutoloopDir "config.json") -Encoding utf8

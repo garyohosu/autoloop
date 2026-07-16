@@ -7,6 +7,8 @@
 
 > Codex CLIおよびClaude Codeの具体的なオプションは、実装開始時にインストール済みバージョンの`--help`と公式仕様で再確認する。本書では、非対話実行、セッションID保存、resumeが可能であることを前提とする。
 
+> **実装状況の注記（2026-07-16）**: 本書が定義する `InstructionFrontMatter` / `TaskStatus`（8値: draft/ready/running/completed/approval_required/blocked/failed/release_ready）を伴う Planner・session resume・Agent fallback・Controller自身によるcommit/push は未実装のままである。現在実装済みの `controller.py` には、本書とは別の、より小さい独立機能として single-task gate （`allow_task_chaining: false`、front matter は `task_id`/`status` の2項目のみ、`status` は pending/in_progress/completed/blocked/failed の5値）がある。本書の `TaskStatus` 8値とは別物であり、本書の一部実装ではない。実際の挙動は `README.md`「Single-task gate」節、設計判断は `QandA.md` Q-07 を参照。
+
 ---
 
 ## 1. 目的

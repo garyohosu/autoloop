@@ -34,3 +34,15 @@
 - **論点**: dream.md 等の個人ファイルを worktree に置いたまま自動運転する方法。
 - **暫定方針**: 個人ファイルは `.git/info/exclude`(ローカル除外)へ登録して preflight の未追跡検査から除外し、Verifier は除外済みファイルへの変更有無を別途検査する。TESTCASE T-217 はこの前提で記述した。
 - **状態**: 暫定方針で続行(SPEC.md の修正候補)
+
+## Q-07: 実装済み single-task gate（`allow_task_chaining`）の設計判断（2026-07-16）
+
+本項は SPEC.md 記載の大規模な Planner/session resume 設計とは別に、`controller.py` へ実際に実装・出荷された small-scope 機能についての記録である。QandA Q-01〜Q-06 が扱う `InstructionFrontMatter`/`TaskStatus`（8値）とは別物で、`task_id`/`status`（5値: pending/in_progress/completed/blocked/failed）のみを読む軽量な front matter ゲートである。
+
+- **なぜ `allow_task_chaining` の既定値を `true` にするか**: この機能追加より前に書かれた既存の `config.json` は `allow_task_chaining` キー自体を持たない。既定を `false`（ゲート有効）にすると、`task_file` が存在しない既存プロジェクトでゲートが即座に `task_gate_invalid` を返し、既存の「Agentが自由にタスクを選ぶ」運用を無条件に壊してしまう。既定を `true`（従来動作）にすることで、キーを追加しない限り挙動が変わらないことを保証する。
+- **なぜ `task_file` をdirty-worktree検査から除外しないか**: `task_file` の `status` 変更はAutoLoopにとって「AutoLoop自身の内部帳簿（`.runtime/`・`.autoloop/`）」ではなく、そのタスクが完了・保留・失敗したという実質的な作業成果である。除外すると、Agentが `status: completed` に書き換えた事実を次回起動時に見落とし、人間や別Agentが古いタスク状態のまま次の判断をしてしまう危険がある。
+- **なぜ `task_id` の変更を自動承認しないか**: ゲートの目的は「指示書に書かれた1件だけを実行する」ことであり、Agent自身が `task_id` を書き換えられるなら、承認されていない別タスクへ自己判断で移ることを防げず、ゲートの意味がなくなる。`task_id` が変化した場合は無条件で `human_confirmation`（exit 2）とし、人間の確認なしに次のタスクへ進ませない。
+- **なぜ `task_file` 不正時に fail close するか（`task_gate_invalid`）**: ゲートファイルが存在しない・読めない・front matter が壊れている・`task_id`/`status` が空または未知の値である場合、どのタスクが承認されているかをプログラムが確定できない。この状態でAgentを起動すると、承認されていない作業を実行してしまう可能性があるため、判断不能な場合は常に「起動しない」側に倒す（`no_pending_task` ではなく `task_gate_invalid`、exit 1）。
+- **`pending` と `in_progress` をどう扱うか**: 両方を「着手が承認された状態」として同一に扱う。サイクル開始時・Agent実行後の継続判定のどちらでも、`pending` と `in_progress` は同じ経路（Agent起動 / `continue`）に合流する。`in_progress` は `pending` の同義語として、Agentが「作業に着手したが未完了」であることをより具体的に示したいときに使う目的だけを持つ。既存の `completed`/`blocked`/`failed` はいずれも「今は着手できない・停止する」側に分類する。
+
+**変更ファイル**: `src/oracle_council/...` に相当する対象はなし（本リポジトリの対象は `controller.py`/`controller_tests.py`/`README.md`/`config.example.json`/`install.ps1`/本ファイルのみ）。排他ロック、Planner、tasks.yamlキュー、複数Agent、フェイルオーバー、worktree分離は本項の対象外で未着手のまま。

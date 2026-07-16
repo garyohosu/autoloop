@@ -97,6 +97,13 @@ class Config:
     push_enabled: bool = False
     allow_dirty_worktree: bool = False
     allowed_dirty_paths: list[str] = field(default_factory=list)
+    # Single-task gate (opt-in; default allow_task_chaining=True means this
+    # is off). Existing configs that omit this key keep the original "agent
+    # picks any task" behaviour unchanged. Set allow_task_chaining=false to
+    # restrict AutoLoop to the one task_id named in task_file, stopping once
+    # its status leaves the actionable set ("pending"/"in_progress").
+    allow_task_chaining: bool = True
+    task_file: str = "instructions/instructions.md"
 
     @classmethod
     def load(cls, path: Path, root: Path | None = None) -> "Config":
@@ -168,6 +175,8 @@ class Config:
             bool(raw.get("push_enabled", False)),
             bool(raw.get("allow_dirty_worktree", False)),
             [relative(item) for item in allowed_raw],
+            allow_task_chaining=bool(raw.get("allow_task_chaining", True)),
+            task_file=relative(str(raw.get("task_file", "instructions/instructions.md"))),
         )
 
 
@@ -192,6 +201,64 @@ class Lock:
             except OSError as exc:
                 print(f"warning: lock release failed: {exc}", file=sys.stderr)
             self.held = False
+
+
+_TASK_FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+_TASK_FIELD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+
+# Status values the gate file's front matter may declare. "pending" and
+# "in_progress" both authorize an agent cycle; "completed"/"blocked"/"failed"
+# are recognized but stop the loop without spending an agent call.
+TASK_GATE_STATUSES = frozenset({"pending", "in_progress", "completed", "blocked", "failed"})
+ACTIONABLE_TASK_STATUSES = frozenset({"pending", "in_progress"})
+
+
+@dataclass
+class TaskGateState:
+    """Result of parsing the single-task gate file's front matter.
+
+    valid=False covers every fail-closed case in the gate contract
+    (missing file, unreadable, malformed front matter, missing/empty
+    task_id or status, unrecognized status), so callers never have to
+    guess at the reason from a bare None. task_id/status may still be
+    set on some invalid results (e.g. an unrecognized status) for receipt
+    diagnostics; error is always a short, safe (no raw file body) reason
+    whenever valid is False.
+    """
+
+    valid: bool
+    task_id: str | None = None
+    status: str | None = None
+    error: str | None = None
+
+
+def read_task_state(root: Path, task_file: str) -> TaskGateState:
+    """Parse the task_id/status YAML-style frontmatter of task_file."""
+    path = root / task_file
+    if not path.is_file():
+        return TaskGateState(valid=False, error="task_file not found")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return TaskGateState(valid=False, error="task_file could not be read")
+    match = _TASK_FRONTMATTER_RE.match(text)
+    if not match:
+        return TaskGateState(valid=False, error="task_file front matter missing or malformed")
+    fields = dict(_TASK_FIELD_RE.findall(match.group(1)))
+    task_id = fields.get("task_id", "").strip()
+    status = fields.get("status", "").strip()
+    if not task_id:
+        return TaskGateState(valid=False, error="task_id missing or empty")
+    if not status:
+        return TaskGateState(valid=False, task_id=task_id, error="status missing or empty")
+    if status not in TASK_GATE_STATUSES:
+        return TaskGateState(
+            valid=False,
+            task_id=task_id,
+            status=status,
+            error=f"status not recognized: {status!r}",
+        )
+    return TaskGateState(valid=True, task_id=task_id, status=status)
 
 
 def _clean_status_path(value: str) -> str:
@@ -350,11 +417,39 @@ def requests_human_confirmation(stdout: str) -> bool:
     return False
 
 
-def build_prompt(config: Config, previous: dict[str, Any] | None) -> str:
+def build_prompt(
+    config: Config,
+    previous: dict[str, Any] | None,
+    gate: "TaskGateState | None" = None,
+) -> str:
     files = "\n".join(
         f"- {name}" for name in config.design_files if (config.root / name).is_file()
     )
     previous_text = json.dumps(previous, ensure_ascii=False) if previous else "なし"
+
+    if not config.allow_task_chaining:
+        task_id = gate.task_id if gate is not None else "(unknown)"
+        return f"""このプロジェクトは設計工程を完了しています。
+
+正本となる設計資料:
+{files or '- 設計資料は見つかりません'}
+
+今回実装してよいタスクは、{config.task_file} の先頭front matterに記載された1件だけです。
+task_id: {task_id}
+
+{config.task_file} を開き、そこに書かれた背景・仕様・実装方針・非対象・完了報告の指示にすべて従ってください。設計資料やQandA、FIX_PLANの他の未着手項目を自分で選んで実装してはいけません。今回のtask_id以外のタスクへ着手せず、front matterの `task_id` の値自体も変更しないでください。
+
+未回答のQandAやBLOCKED項目を検出しても、直ちに人間確認で停止しないでください。今回のtask_idに関係する範囲でのみ、既存仕様との整合、後方互換性、変更量、可逆性、安全性を基準に、最も妥当な技術的既定案を自動選択してください。選択した判断をQandA.mdへAUTO_DECIDEDとして記録し、必要な設計資料へ最小限反映したうえで実装してください。
+
+人間確認が必要なのは、不可逆・破壊的変更、金銭、秘密情報、外部公開、法務、根本的な仕様変更、または安全な既定案が存在しない場合だけです。その場合は {config.task_file} の `status:` を `blocked` に書き換え、結果に理由を記録してください。作業を試みたものの完了できずエラーで終わった場合は `status:` を `failed` に書き換えてください。作業に着手済みでまだ続きがある場合は `status:` を `pending` のままにするか、作業継続中であることを示す `in_progress` にしてください。設計資料を勝手に全面変更せず、設計にない機能、不要な大規模リファクタリング、commit、push、PRを行わないでください（git commit・git pushはAgent自身が行わず、人間が確認したうえで行います）。
+
+前回receiptの概要:
+{previous_text}
+
+今回のtask_id（{task_id}）の実装とテストが完了したら、必ず {config.task_file} の先頭front matterの `status:` の値だけを `completed` に書き換えてください（`task_id` の値は変更しないでください）。完了できなかった場合は上記のとおり `pending`・`in_progress`・`blocked`・`failed` のいずれかに書き換えてください。この `status:` の更新が、このタスクの状態をシステムへ伝える唯一の合図です。
+
+完了時は、選択肢、自動決定、決定理由、QandAへの記録、実装内容、変更ファイル、テスト結果、未解決事項を報告してください。"""
+
     return f"""このプロジェクトは設計工程を完了しています。
 
 正本となる設計資料:
@@ -369,7 +464,41 @@ def build_prompt(config: Config, previous: dict[str, Any] | None) -> str:
 前回receiptの概要:
 {previous_text}
 
-完了時は、選択タスク、選択肢、自動決定、決定理由、QandAへの記録、実装内容、変更ファイル、テスト結果、未解決事項、次候補、プロジェクト全体の完了 여부を報告してください。"""
+完了時は、選択タスク、選択肢、自動決定、決定理由、QandAへの記録、実装内容、変更ファイル、テスト結果、未解決事項、次候補、プロジェクト全体が完了したかどうかを報告してください。"""
+
+
+def _base_receipt(cycle: int, started: str, project_root: Path, agent_name: str) -> dict[str, Any]:
+    """Receipt fields every cycle path must produce (agent-run or not).
+
+    Early-return paths (no_pending_task, task_gate_invalid) fill these in
+    with empty/None defaults instead of omitting them, so a receipt
+    consumer never has to special-case which fields exist.
+    """
+    return {
+        "cycle": cycle,
+        "started_at": started,
+        "finished_at": None,
+        "project_root": str(project_root),
+        "agent": agent_name,
+        "agent_exit_code": None,
+        "test_exit_codes": [],
+        "changed_files": [],
+        "stdout_file": None,
+        "stderr_file": None,
+        "decision": None,
+        "before_changed_files": [],
+        "tests": [],
+        "agent_error": None,
+        "preexisting_dirty_files": [],
+        "agent_changed_files": [],
+        "protected_dirty_violations": [],
+        "task_gate_enabled": False,
+        "task_file": None,
+        "task_id": None,
+        "task_status_before": None,
+        "task_status_after": None,
+        "task_gate_error": None,
+    }
 
 
 class Controller:
@@ -395,10 +524,64 @@ class Controller:
             raise ControllerError(
                 f"cycle artifacts already exist, refusing to overwrite: cycle-{number:03d}"
             )
+
+        gate_enabled = not self.config.allow_task_chaining
         started = timestamp()
+        gate: TaskGateState | None = None
+
+        if gate_enabled:
+            gate = read_task_state(self.config.root, self.config.task_file)
+
+            if not gate.valid:
+                # Fail closed: missing/unreadable/malformed gate file, or a
+                # missing/empty/unrecognized task_id or status. The agent is
+                # never started and verification never runs.
+                run_dir.mkdir(parents=True)
+                receipt = _base_receipt(number, started, self.config.root, self.config.agent_name)
+                receipt.update(
+                    finished_at=timestamp(),
+                    changed_files=changed_files(self.config.root, self.excludes),
+                    decision="task_gate_invalid",
+                    preexisting_dirty_files=sorted(protected),
+                    task_gate_enabled=True,
+                    task_file=self.config.task_file,
+                    task_id=gate.task_id,
+                    task_status_before=gate.status,
+                    task_gate_error=gate.error,
+                )
+                receipt_file.parent.mkdir(parents=True, exist_ok=True)
+                receipt_file.write_text(
+                    json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                return receipt
+
+            if gate.status not in ACTIONABLE_TASK_STATUSES:
+                # Nothing approved to work on right now (completed/blocked/
+                # failed): stop without spending an agent call. max_cycles is
+                # a retry budget for the one pending task_id, not a license
+                # to look for other work.
+                run_dir.mkdir(parents=True)
+                receipt = _base_receipt(number, started, self.config.root, self.config.agent_name)
+                receipt.update(
+                    finished_at=timestamp(),
+                    changed_files=changed_files(self.config.root, self.excludes),
+                    decision="no_pending_task",
+                    preexisting_dirty_files=sorted(protected),
+                    task_gate_enabled=True,
+                    task_file=self.config.task_file,
+                    task_id=gate.task_id,
+                    task_status_before=gate.status,
+                    task_status_after=gate.status,
+                )
+                receipt_file.parent.mkdir(parents=True, exist_ok=True)
+                receipt_file.write_text(
+                    json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                return receipt
+
         run_dir.mkdir(parents=True)
         before = changed_files(self.config.root, self.excludes)
-        prompt = build_prompt(self.config, previous)
+        prompt = build_prompt(self.config, previous, gate)
 
         if self.config.prompt_delivery == "stdin":
             agent_command, agent_input = self.config.agent_command, prompt
@@ -443,6 +626,32 @@ class Controller:
         human = requests_human_confirmation(stdout)
         complete = "PROJECT_COMPLETE" in stdout or "プロジェクト全体が完了" in stdout
 
+        gate_after: TaskGateState | None = None
+        task_id_changed = False
+        task_completed = False
+        task_needs_human = False
+        task_gate_broken_after = False
+        if gate_enabled and gate is not None:
+            gate_after = read_task_state(self.config.root, self.config.task_file)
+            if not gate_after.valid:
+                # The agent left the gate file broken (deleted, malformed,
+                # unrecognized status, ...). Fail closed the same way an
+                # invalid gate file at cycle start would.
+                task_gate_broken_after = True
+            else:
+                task_id_changed = gate_after.task_id != gate.task_id
+                if not task_id_changed:
+                    if gate_after.status == "completed":
+                        task_completed = True
+                    elif gate_after.status in ("blocked", "failed"):
+                        # Agent recorded it cannot/did not finish. Stop and
+                        # wait for a human; never auto-advance to another
+                        # task_id on its own.
+                        task_needs_human = True
+                    # "pending"/"in_progress": falls through to the normal
+                    # continue/no_change handling below, same as before the
+                    # gate existed - max_cycles keeps retrying this task_id.
+
         if error:
             decision = error
         elif violations:
@@ -451,6 +660,18 @@ class Controller:
             decision = "agent_failed"
         elif test_failed and self.config.stop_on_test_failure:
             decision = "test_failed"
+        elif task_id_changed:
+            # allow_task_chaining is off: the gate file's task_id is the
+            # only approved unit of work. The agent changing it on its own
+            # is treated the same as any other decision only a human should
+            # make, not a routine "continue".
+            decision = "human_confirmation"
+        elif task_gate_broken_after:
+            decision = "task_gate_invalid"
+        elif task_completed:
+            decision = "completed"
+        elif task_needs_human:
+            decision = "human_confirmation"
         elif human:
             decision = "human_confirmation"
         elif complete:
@@ -460,25 +681,31 @@ class Controller:
         else:
             decision = "continue"
 
-        receipt = {
-            "cycle": number,
-            "started_at": started,
-            "finished_at": timestamp(),
-            "project_root": str(self.config.root),
-            "agent": self.config.agent_name,
-            "agent_exit_code": exit_code,
-            "test_exit_codes": [item["exit_code"] for item in tests],
-            "changed_files": after,
-            "stdout_file": str(stdout_file),
-            "stderr_file": str(stderr_file),
-            "decision": decision,
-            "before_changed_files": before,
-            "tests": tests,
-            "agent_error": error,
-            "preexisting_dirty_files": sorted(protected),
-            "agent_changed_files": [path for path in after if path not in protected],
-            "protected_dirty_violations": violations,
-        }
+        receipt = _base_receipt(number, started, self.config.root, self.config.agent_name)
+        receipt.update(
+            finished_at=timestamp(),
+            agent_exit_code=exit_code,
+            test_exit_codes=[item["exit_code"] for item in tests],
+            changed_files=after,
+            stdout_file=str(stdout_file),
+            stderr_file=str(stderr_file),
+            decision=decision,
+            before_changed_files=before,
+            tests=tests,
+            agent_error=error,
+            preexisting_dirty_files=sorted(protected),
+            agent_changed_files=[path for path in after if path not in protected],
+            protected_dirty_violations=violations,
+            task_gate_enabled=gate_enabled,
+        )
+        if gate_enabled and gate is not None:
+            receipt.update(
+                task_file=self.config.task_file,
+                task_id=gate.task_id,
+                task_status_before=gate.status,
+                task_status_after=(gate_after.status if gate_after is not None and gate_after.valid else None),
+                task_gate_error=(gate_after.error if gate_after is not None and not gate_after.valid else None),
+            )
         receipt_file.parent.mkdir(parents=True, exist_ok=True)
         receipt_file.write_text(
             json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -530,7 +757,7 @@ class Controller:
             self.lock.release()
 
 
-SUCCESS_DECISIONS = frozenset({"completed", "continue", "no_change"})
+SUCCESS_DECISIONS = frozenset({"completed", "continue", "no_change", "no_pending_task"})
 HUMAN_CONFIRMATION_EXIT_CODE = 2
 
 

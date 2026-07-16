@@ -279,6 +279,81 @@ The agent is selected entirely through `agent.command`:
 
 This allows the same controller to work with different coding agents when they provide a non-interactive CLI.
 
+## Single-task gate (`allow_task_chaining`)
+
+By default AutoLoop lets the agent pick any small task it likes each cycle (`allow_task_chaining: true`, the default, and the only behaviour before this feature existed). This kept existing `config.json` files working unchanged.
+
+Set `allow_task_chaining: false` to restrict AutoLoop to exactly one task, named in a gate file (`task_file`, default `instructions/instructions.md`), instead of letting the agent choose freely. This closes a real gap: without the gate, a cycle where the agent finished one task and then quietly picked another looked identical to normal progress, so a run assigned to implement task S-9 could silently chain through S-10, T-3, and more.
+
+```json
+{
+  "allow_task_chaining": false,
+  "task_file": "instructions/instructions.md"
+}
+```
+
+`task_file` must be a non-empty, relative path inside the target Git repository; an absolute path or a path that escapes the repository root with `..` is rejected at config-load time (`ControllerError`, agent never starts).
+
+### Gate file front matter
+
+The gate file's leading YAML-style front matter is the only thing AutoLoop reads:
+
+```markdown
+---
+task_id: S-4
+status: pending
+---
+
+# S-4
+
+Task details for the agent go here.
+```
+
+`task_id` and `status` are required and must be non-empty. Recognized `status` values:
+
+| status | Meaning | At cycle start | After the agent runs (same `task_id`) |
+|---|---|---|---|
+| `pending` | Approved, not started | Agent runs | Loop continues (retry budget) |
+| `in_progress` | Approved, partially done | Agent runs (treated the same as `pending`) | Loop continues (retry budget) |
+| `completed` | Done | Stops, `no_pending_task`, exit 0 | Stops, `completed`, exit 0 |
+| `blocked` | Needs a human decision | Stops, `no_pending_task`, exit 0 | Stops, `human_confirmation`, exit 2 |
+| `failed` | Attempted but did not succeed | Stops, `no_pending_task`, exit 0 | Stops, `human_confirmation`, exit 2 |
+
+`in_progress` is deliberately adopted as an alias for `pending` in both places — see `QandA.md` for why. If you never use `in_progress`, nothing changes for you.
+
+Any other problem — the file is missing, unreadable, has no parseable front matter, or `task_id`/`status` is missing, empty, or not one of the five values above — is `task_gate_invalid` (exit 1). The agent is never started and verification never runs. This also applies if the agent itself leaves the file broken (e.g. deletes it or writes an unrecognized status) after running.
+
+If the agent changes `task_id` to something else without approval, that is `human_confirmation` (exit 2), not a hop to the new task — AutoLoop never auto-advances to a different `task_id` on its own. `max_cycles` is a retry budget for the *one* approved `task_id`, not a budget for working through many.
+
+### `task_file` and dirty-worktree detection
+
+`task_file` is **not** excluded from AutoLoop's dirty-worktree check (unlike `.autoloop/` and the runtime directory, which are AutoLoop's own bookkeeping). When the agent flips `status` to `completed` (or anything else) to signal the task is done, that edit is a real, meaningful change — losing track of it would let a stale task's actual state go unnoticed by whoever (human, or another agent) looks next.
+
+With the default `commit_enabled: false`, AutoLoop does not commit that status change for you. That means after a cycle finishes, the repository is left dirty with just that one edit, and **the very next AutoLoop invocation will refuse to start** (`dirty_worktree`) until a human reviews and commits (or otherwise resolves) it — in addition to writing the next `task_id` into the gate file. Plan for both steps, not just picking the next task.
+
+### Example: OracleCouncil
+
+```json
+{
+  "allow_task_chaining": false,
+  "task_file": "instructions/instructions.md"
+}
+```
+
+```powershell
+Set-Location C:\PROJECT\OracleCouncil
+.\.autoloop\run-autoloop.ps1 -Once
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| `task_gate_invalid` immediately, no agent output | `task_file` missing, malformed front matter, or an empty/unrecognized `task_id`/`status` | Open `task_file` and check the leading `---`/`---` block matches the format above |
+| `no_pending_task`, exit 0, no agent output | `status` is `completed`/`blocked`/`failed` already | A human needs to write the next `task_id` and set `status: pending` |
+| `dirty_worktree` right after a completed cycle | The previous cycle's `status: completed` edit to `task_file` was never committed (`commit_enabled: false`) | Review and commit (or otherwise resolve) that change before the next `task_id` |
+| `human_confirmation`, exit 2, after a cycle | The agent changed `task_id`, or set `status` to `blocked`/`failed` | Read the receipt's `task_status_after` / `agent_error`, decide, then update `task_file` yourself |
+
 ## Runtime output
 
 Runtime files are written to the target project, not to the AutoLoop repository:
@@ -339,11 +414,11 @@ The controller process exit code reflects the final decision:
 
 | Final decision | Process exit code |
 |---|---|
-| `completed`, `continue`, `no_change` | 0 |
+| `completed`, `continue`, `no_change`, `no_pending_task` | 0 |
 | `human_confirmation` | 2 |
-| `dirty_worktree`, `protected_dirty_changed`, `agent_failed`, `test_failed`, `agent_not_found`, `timeout`, other errors | 1 |
+| `dirty_worktree`, `protected_dirty_changed`, `agent_failed`, `test_failed`, `agent_not_found`, `timeout`, `task_gate_invalid`, other errors | 1 |
 
-`human_confirmation` uses a dedicated exit code (2) so callers can distinguish "needs a human decision" from real failures.
+`human_confirmation` uses a dedicated exit code (2) so callers can distinguish "needs a human decision" from real failures. `no_pending_task` and `task_gate_invalid` only occur when the single-task gate (`allow_task_chaining: false`) is enabled; see "Single-task gate" above.
 
 ## Tests
 
@@ -367,6 +442,7 @@ This is an early Phase 1 implementation. It currently has:
 - target-side logs, receipts, and locking
 - dirty-worktree rejection and pre-existing dirty-file protection
 - cycle numbering that continues from existing runtime history
+- an opt-in single-task gate (`allow_task_chaining: false`) that restricts a run to one `task_id`
 
 It does not currently provide:
 

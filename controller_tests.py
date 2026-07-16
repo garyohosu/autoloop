@@ -15,8 +15,10 @@ from controller import (
     VALID_PROMPT_DELIVERIES,
     build_prompt,
     exit_code_for,
+    HUMAN_CONFIRMATION_EXIT_CODE,
     main,
     next_cycle_number,
+    read_task_state,
     resolve_config_path,
     resolve_project_root,
 )
@@ -69,6 +71,12 @@ class BaseControllerTest(unittest.TestCase):
             stop_on_test_failure=kwargs.get("stop_on_test_failure", False),
             allow_dirty_worktree=kwargs.get("allow_dirty_worktree", False),
             allowed_dirty_paths=kwargs.get("allowed_dirty_paths", []),
+            # These generic tests exercise agent/verification/dirty-worktree
+            # mechanics from before the single-task gate existed, so they
+            # opt back into the old "pick any task" behaviour. Task-gate
+            # semantics (the new default) get their own TaskGateTests below.
+            allow_task_chaining=kwargs.get("allow_task_chaining", True),
+            task_file=kwargs.get("task_file", "instructions/instructions.md"),
         )
 
 
@@ -507,6 +515,7 @@ class ExitCodeTests(BaseControllerTest):
                 "design_files": ["SPEC.md"],
                 "verification_commands": [[sys.executable, "-c", "raise SystemExit(1)"]],
                 "stop_on_test_failure": True,
+                "allow_task_chaining": True,
             },
         )
         self.assertEqual(code, 1)
@@ -546,6 +555,460 @@ class ExitCodeTests(BaseControllerTest):
         # Verify codex and claude blocks are intact
         self.assertIn('"codex"', content)
         self.assertIn('"claude"', content)
+
+
+GATE_FILE = "instructions/instructions.md"
+
+
+class TaskGateTests(BaseControllerTest):
+    """The single-task gate (allow_task_chaining, default true = off).
+
+    Without this gate, a cycle whose agent reported one task complete and
+    then picked another task on its own was indistinguishable from normal
+    progress: the loop just kept running. These tests pin down the fix -
+    when allow_task_chaining=false, AutoLoop must only ever work the
+    task_id named in the gate file, and must stop the moment that task's
+    status leaves the actionable set ("pending"/"in_progress"), using
+    max_cycles as a retry budget for that one task rather than a budget
+    for hopping across many. allow_task_chaining defaults to true so any
+    existing config.json that predates this feature keeps its original
+    "agent picks any task" behaviour unchanged.
+
+    Every agent command here is `self.agent(...)`: a small temporary
+    Python script run as a subprocess. No real Claude/Codex/Antigravity
+    process is ever started by this test class.
+    """
+
+    def write_gate(
+        self, root: Path, task_id: str = "T-1", status: str = "pending", newline: str = "\n"
+    ) -> None:
+        # Committed, not left dirty: the pre-existing dirty-worktree gate in
+        # Controller.run() must not confuse "expected project file" with
+        # "agent left something uncommitted", so tests give it a clean base.
+        gate = root / GATE_FILE
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        body = f"---{newline}task_id: {task_id}{newline}status: {status}{newline}---{newline}{newline}# {task_id}{newline}{newline}body{newline}"
+        gate.write_bytes(body.replace("\n", newline).encode("utf-8"))
+        subprocess.run(["git", "add", GATE_FILE], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", f"gate: {task_id} {status}"], cwd=root, check=True)
+
+    def write_raw_gate(self, root: Path, content: str) -> Path:
+        # For parser-only tests that call read_task_state() directly and
+        # never touch Controller.run()'s dirty-worktree gate.
+        gate = root / GATE_FILE
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        gate.write_text(content, encoding="utf-8")
+        return gate
+
+    def gated_config(self, root: Path, command: list[str], **kwargs) -> Config:
+        return Config(
+            root,
+            design_files=["SPEC.md"],
+            verification_commands=kwargs.get(
+                "verification_commands", [[sys.executable, "-c", "pass"]]
+            ),
+            agent_command=command,
+            agent_timeout_seconds=kwargs.get("timeout", 5),
+            max_cycles=kwargs.get("max_cycles", 3),
+            allow_task_chaining=False,
+            commit_enabled=kwargs.get("commit_enabled", False),
+        )
+
+    # -- Config schema and backward compatibility -------------------------
+
+    def test_config_default_allows_task_chaining(self):
+        root = self.repo()
+        path = root / "config.json"
+        path.write_text("{}", encoding="utf-8")
+        config = Config.load(path, root)
+        self.assertTrue(config.allow_task_chaining)
+        self.assertEqual(config.task_file, "instructions/instructions.md")
+
+    def test_omitted_config_keeps_legacy_behavior(self):
+        # A config.json written before this feature existed has neither key.
+        # It must keep picking tasks freely, with no task_file required.
+        root = self.repo()
+        marker = root / "agent_ran.txt"
+        agent = self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")
+        config = Config(
+            root,
+            design_files=["SPEC.md"],
+            verification_commands=[[sys.executable, "-c", "pass"]],
+            agent_command=agent,
+            max_cycles=1,
+        )
+        self.assertTrue(config.allow_task_chaining)
+        receipts = Controller(config).run(once=True)
+        self.assertTrue(marker.exists(), "legacy behaviour must still invoke the agent")
+        self.assertEqual(receipts[0]["decision"], "continue")
+        self.assertFalse(receipts[0]["task_gate_enabled"])
+
+    def test_explicit_task_chaining_false_enables_gate(self):
+        root = self.repo()
+        path = root / "config.json"
+        path.write_text(json.dumps({"allow_task_chaining": False}), encoding="utf-8")
+        config = Config.load(path, root)
+        self.assertFalse(config.allow_task_chaining)
+
+    def test_task_file_absolute_path_rejected(self):
+        root = self.repo()
+        path = root / "config.json"
+        for bad in ["C:/abs/task.md", "/rooted/task.md", "//server/share/task.md"]:
+            path.write_text(json.dumps({"task_file": bad}), encoding="utf-8")
+            with self.assertRaises(ControllerError):
+                Config.load(path, root)
+
+    def test_task_file_parent_escape_rejected(self):
+        root = self.repo()
+        path = root / "config.json"
+        path.write_text(json.dumps({"task_file": "../escape/task.md"}), encoding="utf-8")
+        with self.assertRaises(ControllerError):
+            Config.load(path, root)
+
+    # -- Front matter parsing: LF, CRLF, and every invalid case -----------
+
+    def test_read_task_state_parses_frontmatter(self):
+        root = self.repo()
+        self.write_gate(root, task_id="S-9", status="pending")
+        state = read_task_state(root, GATE_FILE)
+        self.assertTrue(state.valid)
+        self.assertEqual(state.task_id, "S-9")
+        self.assertEqual(state.status, "pending")
+
+    def test_read_task_state_parses_crlf_frontmatter(self):
+        root = self.repo()
+        self.write_raw_gate(
+            root,
+            "---\r\ntask_id: S-9\r\nstatus: pending\r\n---\r\n\r\nbody\r\n",
+        )
+        state = read_task_state(root, GATE_FILE)
+        self.assertTrue(state.valid)
+        self.assertEqual(state.task_id, "S-9")
+        self.assertEqual(state.status, "pending")
+
+    def test_read_task_state_missing_file_is_invalid(self):
+        root = self.repo()
+        state = read_task_state(root, GATE_FILE)
+        self.assertFalse(state.valid)
+        self.assertIsNotNone(state.error)
+
+    def test_read_task_state_missing_task_id_is_invalid(self):
+        root = self.repo()
+        self.write_raw_gate(root, "---\nstatus: pending\n---\n\nbody\n")
+        state = read_task_state(root, GATE_FILE)
+        self.assertFalse(state.valid)
+        self.assertIn("task_id", state.error)
+
+    def test_read_task_state_missing_status_is_invalid(self):
+        root = self.repo()
+        self.write_raw_gate(root, "---\ntask_id: S-9\n---\n\nbody\n")
+        state = read_task_state(root, GATE_FILE)
+        self.assertFalse(state.valid)
+        self.assertIn("status", state.error)
+
+    def test_read_task_state_unrecognized_status_is_invalid(self):
+        root = self.repo()
+        self.write_raw_gate(root, "---\ntask_id: S-9\nstatus: somewhere-in-between\n---\n\nbody\n")
+        state = read_task_state(root, GATE_FILE)
+        self.assertFalse(state.valid)
+        self.assertEqual(state.task_id, "S-9")
+        self.assertIn("status", state.error)
+
+    # -- task_gate_invalid: fail closed, agent never starts ---------------
+
+    def test_missing_gate_file_is_task_gate_invalid(self):
+        root = self.repo()
+        marker = root / "agent_ran.txt"
+        agent = self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")
+        config = self.gated_config(root, agent)
+        receipts = Controller(config).run()
+        self.assertEqual([r["decision"] for r in receipts], ["task_gate_invalid"])
+        self.assertFalse(marker.exists(), "agent must not run when the gate file is invalid")
+        self.assertEqual(receipts[0]["tests"], [], "verification must not run either")
+        self.assertNotEqual(exit_code_for(receipts), 0)
+
+    # -- no_pending_task: valid but not actionable right now --------------
+
+    def test_completed_status_stops_without_invoking_agent(self):
+        root = self.repo()
+        self.write_gate(root, status="completed")
+        marker = root / "agent_ran.txt"
+        agent = self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")
+        config = self.gated_config(root, agent)
+        receipts = Controller(config).run()
+        self.assertEqual([r["decision"] for r in receipts], ["no_pending_task"])
+        self.assertFalse(marker.exists(), "agent must not run when no task is pending")
+        self.assertEqual(exit_code_for(receipts), 0)
+
+    def test_blocked_status_stops_without_invoking_agent(self):
+        root = self.repo()
+        self.write_gate(root, status="blocked")
+        marker = root / "agent_ran.txt"
+        agent = self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")
+        config = self.gated_config(root, agent)
+        receipts = Controller(config).run()
+        self.assertEqual([r["decision"] for r in receipts], ["no_pending_task"])
+        self.assertFalse(marker.exists())
+        self.assertEqual(exit_code_for(receipts), 0)
+
+    def test_failed_status_stops_without_invoking_agent(self):
+        root = self.repo()
+        self.write_gate(root, status="failed")
+        marker = root / "agent_ran.txt"
+        agent = self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")
+        config = self.gated_config(root, agent)
+        receipts = Controller(config).run()
+        self.assertEqual([r["decision"] for r in receipts], ["no_pending_task"])
+        self.assertFalse(marker.exists())
+        self.assertEqual(exit_code_for(receipts), 0)
+
+    # -- pending: the one status that starts an agent cycle ---------------
+
+    def test_pending_status_invokes_agent_once(self):
+        root = self.repo()
+        self.write_gate(root, status="pending")
+        marker = root / "agent_ran.txt"
+        agent = self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")
+        config = self.gated_config(root, agent, max_cycles=1)
+        Controller(config).run()
+        self.assertTrue(marker.exists())
+
+    def test_pending_task_completes_and_stops_after_one_cycle(self):
+        root = self.repo()
+        self.write_gate(root, task_id="T-1", status="pending")
+        agent = self.agent(
+            "from pathlib import Path\n"
+            "p = Path('instructions/instructions.md')\n"
+            "p.write_text(p.read_text(encoding='utf-8')"
+            ".replace('status: pending', 'status: completed'), encoding='utf-8')\n"
+            "Path('src').mkdir(exist_ok=True)\n"
+            "Path('src/out.py').write_text('ok', encoding='utf-8')\n"
+        )
+        config = self.gated_config(root, agent, max_cycles=5)
+        receipts = Controller(config).run()
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["decision"], "completed")
+        self.assertEqual(exit_code_for(receipts), 0)
+
+    def test_pending_task_retries_up_to_max_cycles_then_stops(self):
+        root = self.repo()
+        self.write_gate(root, task_id="T-1", status="pending")
+        agent = self.agent(
+            "import uuid\n"
+            "from pathlib import Path\n"
+            "Path(f'src/{uuid.uuid4().hex}.py').write_text('ok', encoding='utf-8')\n"
+        )
+        config = self.gated_config(root, agent, max_cycles=2)
+        receipts = Controller(config).run()
+        self.assertEqual(len(receipts), 2, "must retry the same task_id, not hop to another")
+        self.assertTrue(all(r["decision"] == "continue" for r in receipts))
+        state = read_task_state(root, GATE_FILE)
+        self.assertTrue(state.valid)
+        self.assertEqual(
+            (state.task_id, state.status),
+            ("T-1", "pending"),
+            "task_id must still be the one named in the gate file",
+        )
+
+    # -- task_id changed without approval: human_confirmation, not a hop --
+
+    def test_task_id_changed_without_approval_stops(self):
+        root = self.repo()
+        self.write_gate(root, task_id="T-1", status="pending")
+        agent = self.agent(
+            "from pathlib import Path\n"
+            "p = Path('instructions/instructions.md')\n"
+            "p.write_text(p.read_text(encoding='utf-8')"
+            ".replace('task_id: T-1', 'task_id: T-2'), encoding='utf-8')\n"
+        )
+        config = self.gated_config(root, agent, max_cycles=5)
+        receipts = Controller(config).run()
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["decision"], "human_confirmation")
+        self.assertEqual(exit_code_for(receipts), HUMAN_CONFIRMATION_EXIT_CODE)
+
+    # -- in_progress: treated like pending, both at start and on continue -
+
+    def test_in_progress_status_invokes_agent_at_start(self):
+        root = self.repo()
+        self.write_gate(root, status="in_progress")
+        marker = root / "agent_ran.txt"
+        agent = self.agent(f"from pathlib import Path; Path({str(marker)!r}).write_text('x')")
+        config = self.gated_config(root, agent, max_cycles=1)
+        Controller(config).run()
+        self.assertTrue(marker.exists(), "in_progress is adopted as actionable, same as pending")
+
+    def test_in_progress_after_agent_continues_retry_budget(self):
+        root = self.repo()
+        self.write_gate(root, task_id="T-1", status="pending")
+        agent = self.agent(
+            "from pathlib import Path\n"
+            "p = Path('instructions/instructions.md')\n"
+            "p.write_text(p.read_text(encoding='utf-8')"
+            ".replace('status: pending', 'status: in_progress'), encoding='utf-8')\n"
+            "Path('src').mkdir(exist_ok=True)\n"
+            "Path('src/out.py').write_text('ok', encoding='utf-8')\n"
+        )
+        config = self.gated_config(root, agent, max_cycles=1)
+        receipts = Controller(config).run()
+        self.assertEqual(receipts[0]["decision"], "continue")
+        self.assertEqual(receipts[0]["task_status_after"], "in_progress")
+
+    # -- blocked/failed set by the agent itself: human_confirmation -------
+
+    def test_agent_setting_blocked_status_triggers_human_confirmation(self):
+        root = self.repo()
+        self.write_gate(root, task_id="T-1", status="pending")
+        agent = self.agent(
+            "from pathlib import Path\n"
+            "p = Path('instructions/instructions.md')\n"
+            "p.write_text(p.read_text(encoding='utf-8')"
+            ".replace('status: pending', 'status: blocked'), encoding='utf-8')\n"
+        )
+        config = self.gated_config(root, agent, max_cycles=5)
+        receipts = Controller(config).run()
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["decision"], "human_confirmation")
+        self.assertEqual(exit_code_for(receipts), HUMAN_CONFIRMATION_EXIT_CODE)
+        self.assertEqual(receipts[0]["task_status_after"], "blocked")
+
+    def test_agent_setting_failed_status_triggers_human_confirmation(self):
+        root = self.repo()
+        self.write_gate(root, task_id="T-1", status="pending")
+        agent = self.agent(
+            "from pathlib import Path\n"
+            "p = Path('instructions/instructions.md')\n"
+            "p.write_text(p.read_text(encoding='utf-8')"
+            ".replace('status: pending', 'status: failed'), encoding='utf-8')\n"
+        )
+        config = self.gated_config(root, agent, max_cycles=5)
+        receipts = Controller(config).run()
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0]["decision"], "human_confirmation")
+        self.assertEqual(receipts[0]["task_status_after"], "failed")
+
+    # -- chaining enabled: gate machinery is not consulted at all ---------
+
+    def test_chaining_enabled_ignores_missing_task_file(self):
+        root = self.repo()
+        # No instructions/instructions.md at all, and allow_task_chaining
+        # left at its (now legacy-compatible) default of True.
+        receipt = Controller(self.config(root, allow_task_chaining=True)).run(once=True)[0]
+        self.assertEqual(receipt["decision"], "continue")
+        self.assertFalse(receipt["task_gate_enabled"])
+        self.assertIsNone(receipt["task_file"])
+
+    # -- receipt schema: same base fields on every path --------------------
+
+    _BASE_RECEIPT_FIELDS = (
+        "cycle", "started_at", "finished_at", "project_root", "agent",
+        "agent_exit_code", "test_exit_codes", "changed_files", "stdout_file",
+        "stderr_file", "decision", "before_changed_files", "tests",
+        "agent_error", "preexisting_dirty_files", "agent_changed_files",
+        "protected_dirty_violations", "task_gate_enabled", "task_file",
+        "task_id", "task_status_before", "task_status_after", "task_gate_error",
+    )
+
+    def test_no_pending_task_receipt_has_base_fields(self):
+        root = self.repo()
+        self.write_gate(root, status="completed")
+        agent = self.agent("pass")
+        config = self.gated_config(root, agent)
+        receipt = Controller(config).run()[0]
+        for field in self._BASE_RECEIPT_FIELDS:
+            self.assertIn(field, receipt, f"missing base field: {field}")
+
+    def test_task_gate_invalid_receipt_has_base_fields(self):
+        root = self.repo()
+        agent = self.agent("pass")
+        config = self.gated_config(root, agent)
+        receipt = Controller(config).run()[0]
+        for field in self._BASE_RECEIPT_FIELDS:
+            self.assertIn(field, receipt, f"missing base field: {field}")
+
+    def test_receipt_never_contains_task_file_body(self):
+        root = self.repo()
+        secret_marker = "UNIQUE-GATE-BODY-MARKER-38213"
+        gate = root / GATE_FILE
+        gate.parent.mkdir(parents=True, exist_ok=True)
+        gate.write_text(
+            f"---\ntask_id: T-1\nstatus: pending\n---\n\n{secret_marker}\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", GATE_FILE], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "gate"], cwd=root, check=True)
+        agent = self.agent("pass")
+        config = self.gated_config(root, agent, max_cycles=1)
+        receipt = Controller(config).run()[0]
+        self.assertNotIn(secret_marker, json.dumps(receipt, ensure_ascii=False))
+
+    # -- task_file is not excluded from dirty-worktree detection ----------
+
+    def test_task_file_change_not_excluded_from_dirty_check(self):
+        root = self.repo()
+        self.write_gate(root, task_id="T-1", status="pending")
+        agent = self.agent(
+            "from pathlib import Path\n"
+            "p = Path('instructions/instructions.md')\n"
+            "p.write_text(p.read_text(encoding='utf-8')"
+            ".replace('status: pending', 'status: completed'), encoding='utf-8')\n"
+        )
+        config = self.gated_config(root, agent, max_cycles=1)
+        first = Controller(config).run()
+        self.assertEqual(first[0]["decision"], "completed")
+        # The completed status change is left uncommitted (commit_enabled is
+        # False), so a fresh Controller run must see it as dirty rather than
+        # silently treating the gate file as AutoLoop-internal.
+        second = Controller(self.gated_config(root, agent, max_cycles=1)).run()
+        self.assertEqual(second[0]["decision"], "dirty_worktree")
+        self.assertIn(GATE_FILE, second[0]["dirty_paths"])
+
+    def test_task_file_tracked_regardless_of_commit_enabled(self):
+        root = self.repo()
+        self.write_gate(root, task_id="T-1", status="pending")
+        agent = self.agent(
+            "from pathlib import Path\n"
+            "p = Path('instructions/instructions.md')\n"
+            "p.write_text(p.read_text(encoding='utf-8')"
+            ".replace('status: pending', 'status: completed'), encoding='utf-8')\n"
+        )
+        config = self.gated_config(root, agent, max_cycles=1, commit_enabled=True)
+        receipt = Controller(config).run()[0]
+        self.assertIn(GATE_FILE, receipt["agent_changed_files"])
+
+    def test_task_file_tracked_with_commit_disabled_default(self):
+        root = self.repo()
+        self.write_gate(root, task_id="T-1", status="pending")
+        agent = self.agent(
+            "from pathlib import Path\n"
+            "p = Path('instructions/instructions.md')\n"
+            "p.write_text(p.read_text(encoding='utf-8')"
+            ".replace('status: pending', 'status: completed'), encoding='utf-8')\n"
+        )
+        config = self.gated_config(root, agent, max_cycles=1, commit_enabled=False)
+        receipt = Controller(config).run()[0]
+        self.assertIn(GATE_FILE, receipt["agent_changed_files"])
+
+    # -- Prompt content ----------------------------------------------------
+
+    def test_build_prompt_task_gate_names_task_and_forbids_others(self):
+        root = self.repo()
+        self.write_gate(root, task_id="S-9", status="pending")
+        config = self.gated_config(root, self.agent("pass"))
+        gate = read_task_state(root, GATE_FILE)
+        prompt = build_prompt(config, None, gate)
+        self.assertIn("S-9", prompt)
+        self.assertIn(GATE_FILE, prompt)
+        self.assertIn("以外のタスク", prompt)
+        self.assertIn("in_progress", prompt)
+        self.assertIn("blocked", prompt)
+        self.assertIn("failed", prompt)
+        self.assertIn("push", prompt)
+
+    def test_build_prompt_chaining_enabled_ignores_task_file(self):
+        root = self.repo()
+        config = self.config(root)  # allow_task_chaining=True via helper default
+        prompt = build_prompt(config, None, None)
+        self.assertNotIn(GATE_FILE, prompt)
 
 
 if __name__ == "__main__":

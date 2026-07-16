@@ -3,6 +3,8 @@
 対象: `SPEC.md` v0.1.0 / `USECASE.md`
 前提: QandA Q-01(Phase 1〜2 は人間が指示書作成)、Q-03(`result_commit` は Executor 時点で null)、Q-04(ready 検査は PREFLIGHT と PLAN_VERIFY の両方)
 
+> **実装状況の注記（2026-07-16）**: 本書が定義する `InstructionFrontMatter` / `TaskStatus`（8値: draft/ready/running/completed/approval_required/blocked/failed/release_ready）を伴う Planner・session resume・Agent fallback・Controller自身によるcommit/push は未実装のままである。現在実装済みの `controller.py` には、本書とは別の、より小さい独立機能として single-task gate （`allow_task_chaining: false`、front matter は `task_id`/`status` の2項目のみ、`status` は pending/in_progress/completed/blocked/failed の5値）がある。本書の `TaskStatus` 8値とは別物であり、本書の一部実装ではない。実際の挙動は `README.md`「Single-task gate」節、設計判断は `QandA.md` Q-07 を参照。
+
 ---
 
 ## 1. メインフロー(1タスクの正常系)
